@@ -17,6 +17,7 @@ private:
     BQ79600 &bqBridge;
 
     void sendStackCommand(uint8_t command, const uint8_t *data, uint8_t len);
+    void sendStackCommandto(uint8_t addr, uint8_t command, const uint8_t *data, uint8_t len) ;
 };
 
 #endif

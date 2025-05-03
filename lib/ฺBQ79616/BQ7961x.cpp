@@ -1,23 +1,27 @@
-#ifndef BQ7961X_H
-#define BQ7961X_H
+#include "BQ7961x.h"
 
-#include <vector>          // ← ต้องมี!
-#include "BQ79600.h"
+BQ7961x::BQ7961x(uint8_t address, BQ79600 &bridge) : addr(address), bqBridge(bridge) {}
 
-class BQ7961x {
-public:
-    BQ7961x(uint8_t address, BQ79600 &bridge);
-    void ping();
-    void readCellVoltages();
-    void readTemperature();
-    void reset();
-    void enableBalancing(const std::vector<uint8_t> &cellsToBalance); // ← OK แล้ว
+void BQ7961x::ping() {
+    uint8_t data[] = { addr };
+    sendStackCommand(0x01, data, 1); // PING command
+}
 
-private:
-    uint8_t addr;
-    BQ79600 &bqBridge;
+void BQ7961x::readCellVoltages() {
+    uint8_t data[] = { addr, 0x14 }; // Register address example
+    sendStackCommand(0x03, data, sizeof(data)); // READ
+}
 
-    void sendStackCommand(uint8_t command, const uint8_t *data, uint8_t len);
-};
+void BQ7961x::readTemperature() {
+    uint8_t data[] = { addr, 0x18 }; // Register address example
+    sendStackCommand(0x03, data, sizeof(data)); // READ
+}
 
-#endif
+void BQ7961x::reset() {
+    uint8_t data[] = { addr };
+    sendStackCommand(0x0F, data, 1); // RESET command
+}
+
+void BQ7961x::sendStackCommand(uint8_t command, const uint8_t *data, uint8_t len) {
+    bqBridge.sendCommandTo(addr,command, data, len);
+}
