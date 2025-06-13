@@ -20,6 +20,7 @@ struct BmsDataFrame {
     float gpioTemps[6][2];
     float dieTemps[6];
 };
+VoltageExtrema extrema;
 BmsDataFrame dataBuffer;
 SemaphoreHandle_t dataMutex; 
 BQ79600config config = {
@@ -130,28 +131,16 @@ void balanceTasdk(void *pv) {
         if (bits & BIT_BALANCE_REQUIRED) {
             Serial.println("Balance required! Starting balance process...");
 
-            // ทำการ Balance ที่นี่
-            bms.BalanceCells(1);  // สมมุติว่ามีฟังก์ชัน BalanceCells ใน BQ79600
+             // แปลงแรงดันต่ำสุดเป็นค่า Hex and balance --//
+            voltageToHex(extrema.vmin);  // แปลงแรงดันต่ำสุดเป็นค่า Hex
 
+            bms.BalanceCells(1,0,0,extrema.vmin);  // 0 auto mode, 1 manual mode
             Serial.println("Balance process completed.");
         }
+        
 
         vTaskDelay(pdMS_TO_TICKS(100));  // Delay 100ms
     }
-}
-uint8_t voltageToHex(float Vmin) {
-    // Clamp input range
-    if (Vmin < 2.45) Vmin = 2.45;
-    if (Vmin > 4.00) Vmin = 4.00;
-
-    // Calculate step value
-    uint8_t step = round((Vmin - 2.45) / 0.025) + 1;
-
-    // Clamp output to valid range: 0x01 to 0x3F (1 to 63)
-    if (step < 1) step = 1;
-    if (step > 63) step = 63;
-
-    return (uint8_t)step;
 }
 
 void setup() {
@@ -173,7 +162,7 @@ void setup() {
     voltQueue = xQueueCreate(10, sizeof(float));   // create  Queue , size of float 10
     xTaskCreate(GetdataTask, "ReadVolt", 2048, NULL, 1, NULL);  // create Task Read data
     xTaskCreate(SendCanTask, "SendCAN", 2048, NULL, 1, NULL);    // create Task Send data to CAN
-    xTaskCreate(BalanceTask, "Balance", 2048, NULL, 2, NULL);
+    xTaskCreate(balanceTasdk, "Balance", 2048, NULL, 2, NULL);
 
     // ----------------- config MCP2515 CAN ----------------- //
     mcp2515.reset();
@@ -343,4 +332,18 @@ VoltageExtrema AnalyzeVoltageStats(const std::vector<StackData>& batteryData_pac
     Serial.printf("Overall Vmax: %.4f V at Stack %d Cell %d\n", result.vmax, result.vmaxStack, result.vmaxCell);
 
     return result;
+}
+uint8_t voltageToHex(float Vmin) {
+    // Clamp input range
+    if (Vmin < 2.45) Vmin = 2.45;
+    if (Vmin > 4.00) Vmin = 4.00;
+
+    // Calculate step value
+    uint8_t step = round((Vmin - 2.45) / 0.025) + 1;
+
+    // Clamp output to valid range: 0x01 to 0x3F (1 to 63)
+    if (step < 1) step = 1;
+    if (step > 63) step = 63;
+
+    return (uint8_t)step;
 }

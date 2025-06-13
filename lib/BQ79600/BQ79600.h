@@ -43,6 +43,8 @@ public:
     void IronManOFF();
     bool SetManualAddress(uint8_t manualAddr, unsigned long timeout_ms) ;
     void ReadTemp();
+    void BalanceCells(uint8_t mode , uint8_t stack ,uint8_t cell ,uint8_t Vmin); // mode 1 for manual balance , 0 for auto balance
+    
 private:
     HardwareSerial* uart;
     uint32_t baudRate;
@@ -160,7 +162,6 @@ private:
     bool sendAndReceive(RequestType req_type, byte data_size, byte dev_addr,RegisterAddress reg_addr, std::vector<byte>& data, std::vector<byte>& response);
     bool receiveStackResponse(std::vector<byte>& response, size_t device_count, size_t data_per_device, unsigned long timeout_ms);
     void config_MainADC(uint8_t numcell,uint8_t numStack);
-    void BalanceCells(uint8_t mode);
     void config_OV_UV();
     void config_OT_UT();
     void config_Fault();

@@ -157,10 +157,11 @@ void BQ79600::config_MainADC(uint8_t numcell,uint8_t numStack) {
     //delayMicroseconds(3500);    //  wait for ADC to start 
     delayMicroseconds(192*8);   //  wait for ADC finished 
 }  
-void BQ79600::BalanceCells(uint8_t mode){
+void BQ79600::BalanceCells(uint8_t mode , uint8_t stack ,uint8_t cell ,uint8_t Vmin){
     bool ok;
     // determine the balaneing channels
     data_arr_[0] = 0x01; //  seting time of balancing  10 s
+
     for (int i = 0; i < NumCellsSeries; i++) {
         RegisterAddress reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::CB_CELL1_CTRL) - i);
         sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, reg , data_arr_);
@@ -689,12 +690,12 @@ void BQ79600::cheakstatus1() {
     
     bool ok = this->sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR,RegisterAddress::DEV_CONF1 ,data_arr_, response);
     if (ok) {
-         if (ok) {
+        if (ok) {
         Serial.println("miss you");
     }else {
         Serial.println("fuck u");
+        }
     }
-   }
 }
 
 void BQ79600::offcommand() {
