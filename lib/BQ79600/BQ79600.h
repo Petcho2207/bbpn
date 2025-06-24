@@ -27,13 +27,19 @@ struct StackData {
 
 class BQ79600 {
 public:
+    uint16_t NumSegments; // จำนวน segment ที่ใช้ใน BQ79600
+    uint16_t NumCellsSeries;
+    uint16_t NumThermistors;
+    float ShuntResistance;
     std::vector<StackData> batteryData_pack;
+    
     BQ79600(HardwareSerial &serial, uint32_t baud = 1000000, int tx_pin = 17, BQ79600config config = BQ79600config{});    // constructor
     void initialize();
     void wakeUp();
     void beginUart();
     void AutoAddressing();
     bool ReadMainADC();
+    bool ReadAuxADC();
     void cheakstatus();
     void ReadVoltCellandTemp();
     void cheakstatus1();
@@ -43,30 +49,30 @@ public:
     void IronManOFF();
     bool SetManualAddress(uint8_t manualAddr, unsigned long timeout_ms) ;
     void ReadTemp();
-    void BalanceCells(uint8_t mode , uint8_t stack ,uint8_t cell ,uint8_t Vmin); // mode 1 for manual balance , 0 for auto balance
+    void BalanceCells(uint8_t mode, size_t stack, const std::vector<size_t>& targetCells, size_t preservedCell, uint8_t hexThreshold);
+    bool cheakBalance ();
+    bool checkFaultBase();
+    bool checkFaultBrigh();
+    void clearFault();
     
 private:
     HardwareSerial* uart;
     uint32_t baudRate;
     uint8_t tx_pin_;  // <- เพื่อใช้ใน wakePing()
-    uint16_t NumSegments; // จำนวน segment ที่ใช้ใน BQ79600
-    uint16_t NumCellsSeries;
-    uint16_t NumThermistors;
     int stack_size_{0}; // จำนวน stack ที่ใช้ใน BQ79600
-    float ShuntResistance;
+    
 
     std::vector<uint8_t> bq_frame_;
     std::vector<uint8_t> data_arr_;
     std::vector<uint8_t> response;  
     std::vector<uint8_t> resp_data;  
-        
-    
     enum class RegisterAddress : uint16_t 
     { 
         /// BQ79612 Register Addresses//
         DEV_CONF =  0x0002,
         ACTIVE_CELL     =    0x0003,
         OTP_ECC_DATAIN  =   0x0343,   // OTP ECC Data In 1
+        OTP_ECC_DATAOUT = 0x0510,   // OTP ECC Data Out 1
         ADC_CTRL1     =   0x030D,   // ADC Control 1
         ADC_CTRL2    =   0x030E,   // ADC Control 2 
         VCELL16_HI   =   0x0568,   // VCELL16 High
@@ -111,6 +117,25 @@ private:
         GPIO1_HI = 0x058E ,
         DIETEMP1_HI = 0x05AE, // Die Temperature 1 High
         DIETEMP1_LO = 0x05AF, // Die Temperature 1 Low
+        ADC_CTRL3 = 0x030F, // ADC Control 3
+        BAL_STAT = 0x052B,
+        FAULT_SUMMARY = 0x052D,
+        FAULT_SYS = 0x0536,
+        FAULT_OTP = 0x0535 ,
+        FAULT_RST1 = 0x0331,
+        FAULT_RST2 = 0x0332,
+        FAULT_MSK1 = 0x0016,
+        FAULT_MSK2 = 0x0017,
+        FAULT_PWR1 = 0x0552, // Power Fault 1   
+        FAULT_PWR2 = 0x0553, // Power Fault 2
+        FAULT_PWR3 = 0x0554, // Communication Fault 1
+        CUST_CRC_HI = 0x0036,
+        CUST_CRC_LO = 0x0037,
+        CUST_CRC_RSLT_HI = 0x050C,
+        CUST_CRC_RSLT_LO = 0x050C,
+        TSREF_HI = 0x058C, // TSREF High
+        TSREF_LO = 0x058D, // TSREF Low
+
         /// BQ79600 Register Addresses//
         DIR0_ADDR        =   0x0306,    // Device Address North Direction
         DIR1_ADDR        =   0x0307,    // Device Address South Direction
@@ -126,17 +151,19 @@ private:
         SPI_FIFO_UNLOCK  =   0x2010,   // FIFO Diagnostic Unlock
         FAULT_MSK        =   0x2020,   // Fault Mask
         FAULT_RST        =   0x2030,   // Fault Reset
-        FAULT_SUMMARY    =   0x2100,   // Fault Summary 
-        FAULT_REG        =   0x2101,   // Register Faul
-        FAULT_REG2       =   0x2102,   // System Fault 
-        FAULT_PWR        =   0x2103,   // Power Fault
-        FAULT_COMM1      =   0x2104,   // Communication Fault 1 
+        FAULTM_SUMMARY    =   0x2100,   // Fault Summary master
+        FAULTM_REG        =   0x2101,   // Register Faul
+        FAULTM_REG2       =   0x2102,   // System Fault 
+        FAULTM_PWR        =   0x2103,   // Power Fault
+        FAULTM_COMM1      =   0x2104,   // Communication Fault 1 
         //FAULT_COMM2      =   0x2105,   // Communication Fault 2
         DEV_DIAG_STAT    =   0x2110,   // Diagnostic Status
         DEBUG_COMM_STAT  =  0x2300,
         DEBUG_COMM_CTRL  =  0x2201,   // Debug Communication Control
     
     };
+    
+
 
     enum class RequestType : byte
     {
@@ -157,11 +184,13 @@ private:
     double convertTo_VoltagCell(uint16_t rawValue) ;
     double convertTo_VoltGPIO(uint16_t rawValue) ;
     double convertTo_dietemp(uint16_t rawValue) ;
+    double convertTo_TREFVolt(uint16_t rawValue) ;
     bool receiveResponse(std::vector<byte>& response, size_t expected_size, unsigned long timeout_ms);
     bool validateCRC(const std::vector<byte>& frame) ;
     bool sendAndReceive(RequestType req_type, byte data_size, byte dev_addr,RegisterAddress reg_addr, std::vector<byte>& data, std::vector<byte>& response);
     bool receiveStackResponse(std::vector<byte>& response, size_t device_count, size_t data_per_device, unsigned long timeout_ms);
     void config_MainADC(uint8_t numcell,uint8_t numStack);
+    void config_AuxADC();
     void config_OV_UV();
     void config_OT_UT();
     void config_Fault();
@@ -172,8 +201,9 @@ private:
     uint8_t calcADC_DLY(uint8_t numDevices );
 
     std::vector<std::vector<double>> parseCellVoltages( const std::vector<byte>& response, uint8_t numStacks, uint8_t numCells);
-    std::vector<std::vector<double>> parseTemp( const std::vector<byte>& response, uint8_t numStacks, uint8_t numNTC);
+    std::vector<std::vector<double>> parseTemp( const std::vector<byte>& response,const std::vector<double> TSREF, uint8_t numStacks, uint8_t numNTC);
     std::vector<std::vector<double>> parsedie_Temp( const std::vector<byte>& response, uint8_t numStacks);
+    std::vector<double> parseTSREF(const std::vector<byte>& response, uint8_t numStacks);
 };
 
 #endif

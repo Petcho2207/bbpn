@@ -1,7 +1,6 @@
 #include "BQ79600.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include <SPI.h>
 #include <mcp2515.h>
@@ -9,341 +8,426 @@
 #define LED1 21
 #define LED2 22
 #define Relay 13
-struct VoltageExtrema {
+#define Nfault 4
+enum State
+{
+    Main,
+    Fault,
+};
+volatile State currentState = Main;
+// Structure Definitions
+struct StackVoltageExtrema {
     float vmin;
     float vmax;
-    size_t vminStack, vminCell;
-    size_t vmaxStack, vmaxCell;
+    float averageVcell; 
+    std::vector<size_t> vminCells;
+    std::vector<size_t> vmaxCells;
 };
+int Auto = 1; 
+int Manual = 0;
 struct BmsDataFrame {
     float voltages[6][10];
     float gpioTemps[6][2];
     float dieTemps[6];
 };
-VoltageExtrema extrema;
+
+
+// Globals
+BQ79600config bqConfig;
+std::vector<std::vector<size_t>> currentlyBalancingCells;  // [stack] = list of balancing cell index
+std::vector<StackVoltageExtrema> allStackExtrema;
+SemaphoreHandle_t balanceMutex;  
+SemaphoreHandle_t dataMutex;
 BmsDataFrame dataBuffer;
-SemaphoreHandle_t dataMutex; 
 BQ79600config config = {
     10,      // num_cells_series
-    2,     // num_thermistors
-    1,      // num_segments
-    0.001f  // shunt_resistance
+    2,       // num_thermistors
+    1,       // num_segments
+    0.001f   // shunt_resistance
 };
-const float VoltDiffBalance = 0.3; // Threshold สำหรับ Balance
-HardwareSerial mySerial(1);  // UART1 ของ ESP32
+const float VoltDiffBalance = 0.03; // Threshold for balancing
+const float VoltDiff_StopBalance = 0.01; // Threshold for stop balancing
+
+HardwareSerial mySerial(1);
 BQ79600 bms(mySerial, 1000000, 17, config);
-MCP2515 mcp2515(5); // Pin CS ของ MCP2515
-// ประกาศ EventGroup และ Bit Flag
-// ------------------------
+MCP2515 mcp2515(5); // CS pin
+
 EventGroupHandle_t bmsEventGroup;
-#define BIT_BALANCE_REQUIRED (1 << 0)  // Flag สำหรับแจ้งว่า "ควร Balance"
+#define BIT_BALANCE_REQUIRED (1 << 0)
 
-// ------------------------
-// ประกาศ Queue
-// ------------------------
-QueueHandle_t voltQueue;  // ใช้ส่งค่าแรงดันระหว่าง Task
-
-// ------------------------ read voltage and teperature from BQ79600 ------------------------//
-void GetdataTask(void *pv) {
-
-    for (;;) {
-        
-        bms.ReadVoltCellandTemp();                                                                  // get voltage and temperature from BQ79600
-        VoltageExtrema extrema = AnalyzeVoltageStats(bms.batteryData_pack);                         // Analyze max,min voltage 
-        //xQueueSend(voltQueue, &voltage, portMAX_DELAY);                                           // sent voltage to Queue
-        //xQueueSend(voltQueue, &voltage, portMAX_DELAY);                                           // sent temperature to Queue
-        
-        float voltDiff = extrema.vmax - extrema.vmin;       // คำนวณความต่างของแรงดัน
-        Serial.printf("Voltage Diff: %.2f V\n", voltDiff);  // แสดงผลความต่างแรงดัน
-        // 👇 --- เช็คว่าเกิน Threshold แล้ว Set Event Flag ---
-        if (voltDiff >= VoltDiffBalance) {
-            xEventGroupSetBits(bmsEventGroup, BIT_BALANCE_REQUIRED);       // ⚠️ Trigger Task Balance
-        }   
-
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            for (int s = 0; s < 6; s++) {
-                for (int c = 0; c < 10; c++) {
-                    dataBuffer.voltages[s][c] =bms.batteryData_pack[s].cells[c].voltage;
-                }
-                dataBuffer.gpioTemps[s][0] = bms.batteryData_pack[s].gpioTemps[0];
-                dataBuffer.gpioTemps[s][1] = bms.batteryData_pack[s].gpioTemps[1];
-                dataBuffer.dieTemps[s]     =  bms.batteryData_pack[s].dieTemp;
-            }
-            xSemaphoreGive(dataMutex);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));  // Delay 100ms
-    }
+uint8_t voltageToHex(float Vmin);
+std::vector<StackVoltageExtrema> AnalyzePerStackStats(const std::vector<StackData>&);
+// ----- interrupt --------------//
+volatile bool interruptTriggered = false;
+void IRAM_ATTR handleInterrupt() {
+    interruptTriggered = true;
 }
 
-// ------------------------
-// Task 2: รับค่าแรงดันจาก Queue แล้วส่งผ่าน CAN
-// ------------------------
-void SendCanTask(void *pv) {
-    struct can_frame frame;
-    frame.can_dlc = 23;    // ขนาดข้อมูล 23 bytes (CAN FD)
-
+void FSMTask(void* pv) {
     for (;;) {
-        for (int stackIndex = 0; stackIndex < 6; stackIndex++) {
-            if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                // เตรียมข้อมูลแรงดัน cell 10 ก้อนใน stack เป็น uint16_t (mV)
-                for (int i = 0; i < 10; i++) {
-                    uint16_t v = (uint16_t)(dataBuffer.voltages[stackIndex][i] * 1000.0);
-                    frame.data[2*i] = (v >> 8) & 0xFF;      // high byte
-                    frame.data[2*i + 1] = v & 0xFF;         // low byte
-                }
+    switch (currentState) {
+        case Main: checkStatus(); break;
+        case Fault: handleFault(); break;
+      //case Sleep: handleSleep(); break;
+    }
 
-                // dieTemp ใส่ byte 20
-                frame.data[20] = (int8_t)(dataBuffer.dieTemps[stackIndex]);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+// Task: Read BQ79600 Data
+void GetdataTask(void *pv) {
+    for (;;) {
+        bms.ReadVoltCellandTemp();
+        auto extremaList = AnalyzePerStackStats(bms.batteryData_pack);
+        bool cheakbalance ;
 
-                // TempGPIO1,2 ใส่ byte 21-22
-                frame.data[21] = (int8_t)(dataBuffer.gpioTemps[stackIndex][0]);
-                frame.data[22] = (int8_t)(dataBuffer.gpioTemps[stackIndex][1]);
+            // Critical section: write to shared memory
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            allStackExtrema = extremaList;   // ✅ ปลอดภัยเพราะอยู่ใน mutex
 
-                xSemaphoreGive(dataMutex);
+            for (int s = 0; s < bms.NumSegments; s++) {
+                if (s >= bms.batteryData_pack.size()) break;
+                StackData& stack = bms.batteryData_pack[s];
+
+                for (int c = 0; c < bms.NumCellsSeries; c++) {
+                    if (c >= stack.cells.size()) break;
+                        dataBuffer.voltages[s][c] = stack.cells[c].voltage;
+                    } 
+                    dataBuffer.dieTemps[s] = stack.dieTemp;
+
+                    if (stack.gpioTemps.size() > 0)
+                    dataBuffer.gpioTemps[s][0] = stack.gpioTemps[0];
+                    if (stack.gpioTemps.size() > 1)
+                    dataBuffer.gpioTemps[s][1] = stack.gpioTemps[1];
             }
 
-            // กำหนด CAN ID ตาม stack เพื่อแยกแยะข้อมูล
-            frame.can_id = 0x300 + stackIndex;
-
-            mcp2515.sendMessage(&frame);
-
-            Serial.printf("Sent stack %d data: voltages 10 cells + dieTemp + GPIO temps\n", stackIndex);
-
-            // ถ้าต้องการ delay เล็กน้อยระหว่างส่งแต่ละ stack ให้ใส่ตรงนี้
-            vTaskDelay(pdMS_TO_TICKS(50));
+            xSemaphoreGive(dataMutex);
         }
+        cheakbalance = bms.cheakBalance();
+        if(!cheakbalance) {
+            
+         // Set balancing event flags
+        for (size_t i = 0; i < extremaList.size(); ++i) {
+            
+            float Vdiff = extremaList[i].vmax - extremaList[i].vmin;
+            Serial.printf("Stack %d Voltage Diff: %.2f V\n", (int)i, Vdiff);
+            if (Vdiff >= VoltDiffBalance) {
+                
+                xEventGroupSetBits(bmsEventGroup, BIT_BALANCE_REQUIRED | (i << 1));
+                
+            }
+            else{
+                Serial.printf("No balancing required for stack %d (Vmin=%.3f V | Vmax=%.3f V | Vdiff=%.3f V)\n",
+                (int)i, extremaList[i].vmin, extremaList[i].vmax, Vdiff);
+            }
+        } 
+    }else{
 
-        // ส่งครบ 6 stack แล้ว delay 1 วิ ก่อนส่งรอบถัดไป
+        if (xSemaphoreTake(balanceMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        for (int s = 0; s < currentlyBalancingCells.size(); ++s) {
+                            for (int idx : currentlyBalancingCells[s]) {
+                                float v = bms.batteryData_pack[s].cells[idx].voltage;
+                                Serial.printf("[Realtime] Balancing: Stack %d, Cell %d, Voltage: %.3f V\n", s, idx, v);
+                            }
+                        }
+                        xSemaphoreGive(balanceMutex);
+                }
+    } 
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-// ------------------------
-// Task 3: ตรวจสอบ Event Flag และทำการ Balance
-// ------------------------
-
-void balanceTasdk(void *pv) {
+void SendCanTask(void *pv) {
+    const uint8_t fragLens[3] = {8, 8, 7};
     for (;;) {
-        // รอจนกว่าจะมี Event Flag BIT_BALANCE_REQUIRED ถูกตั้งค่า
-        EventBits_t bits = xEventGroupWaitBits(bmsEventGroup, BIT_BALANCE_REQUIRED, pdTRUE, pdFALSE, portMAX_DELAY);
-        
-        if (bits & BIT_BALANCE_REQUIRED) {
-            Serial.println("Balance required! Starting balance process...");
+        Serial.println("Sending CAN data...");
+        BmsDataFrame localBuffer;
 
-             // แปลงแรงดันต่ำสุดเป็นค่า Hex and balance --//
-            voltageToHex(extrema.vmin);  // แปลงแรงดันต่ำสุดเป็นค่า Hex
-
-            bms.BalanceCells(1,0,0,extrema.vmin);  // 0 auto mode, 1 manual mode
-            Serial.println("Balance process completed.");
+        // Step 1: Critical section – copy data
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            memcpy(&localBuffer, &dataBuffer, sizeof(BmsDataFrame));
+            xSemaphoreGive(dataMutex);
+        } else {
+            Serial.println("Failed to take dataMutex!");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
-        
 
-        vTaskDelay(pdMS_TO_TICKS(100));  // Delay 100ms
+        // Step 2: ใช้ localBuffer ปลอดภัย
+        for (int stackIndex = 0; stackIndex < config.num_segments; stackIndex++) {
+            uint8_t raw[23];
+            int idx = 0;
+
+            for (int i = 0; i < config.num_cells_series; i++) {
+                uint16_t v = (uint16_t)(localBuffer.voltages[stackIndex][i] * 1000.0f);
+                raw[idx++] = (v >> 8) & 0xFF;
+                raw[idx++] = v & 0xFF;
+            }
+
+            raw[idx++] = (uint8_t)((int8_t)localBuffer.dieTemps[stackIndex]);
+            raw[idx++] = (uint8_t)((int8_t)localBuffer.gpioTemps[stackIndex][0]);
+            raw[idx++] = (uint8_t)((int8_t)localBuffer.gpioTemps[stackIndex][1]);
+
+            int offset = 0;
+            for (uint8_t frag = 0; frag < 3; frag++) {
+                struct can_frame frame;
+                frame.can_id  = 0x300 + stackIndex * 4 + frag;
+                frame.can_dlc = fragLens[frag];
+                memcpy(frame.data, &raw[offset], fragLens[frag]);
+                mcp2515.sendMessage(&frame);
+                Serial.printf("Sent stack %d frag %d (%d bytes)\n", stackIndex, frag, fragLens[frag]);
+                offset += fragLens[frag];
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
+
+void balanceTask(void *pv) {
+    for (;;) {
+        EventBits_t bits = xEventGroupWaitBits(bmsEventGroup, BIT_BALANCE_REQUIRED, pdTRUE, pdFALSE, portMAX_DELAY);
+        if(currentState == Main) {
+        if (bits & BIT_BALANCE_REQUIRED) {
+            for (size_t i = 0; i < bms.batteryData_pack.size(); ++i) {
+                const StackData& stack = bms.batteryData_pack[i];
+                const StackVoltageExtrema& extrema = allStackExtrema[i];
+
+                float diff = extrema.vmax - extrema.vmin;
+
+                if (diff >= VoltDiffBalance) {
+                    float overVoltageThreshold = extrema.vmin + VoltDiffBalance;
+
+                    Serial.printf("Stack %d: Cell Voltages:\n", (int)i);
+                    for (size_t j = 0; j < stack.cells.size(); ++j) {
+                            Serial.printf("  Cell %2d (Index %2d) = %.3f V\n", (int)(j+1), (int)j, stack.cells[j].voltage);
+                    }
+                    // === ค้นหา cell ที่แรงดันเกิน threshold นี้ ===
+                    std::vector<size_t> overVoltageCells;
+                    for (size_t j = 0; j < stack.cells.size(); ++j) {
+                        float cellVoltage = stack.cells[j].voltage;
+                        if (cellVoltage >= overVoltageThreshold) {
+                            overVoltageCells.push_back(j);
+                        }
+                    }
+
+                    // === เรียงจากแรงดันสูงสุดไปต่ำสุด ===
+                    std::sort(overVoltageCells.begin(), overVoltageCells.end(), [&](size_t a, size_t b) {
+                        return stack.cells[a].voltage > stack.cells[b].voltage;
+                    });
+
+                    // === กรอง: ห้ามเลือก cell ที่ติดกัน (index ห่าง ≤ 1) ===
+                    std::vector<size_t> filteredCells;
+                    for (size_t j = 0; j < overVoltageCells.size(); ++j) {
+                        size_t current = overVoltageCells[j];
+                        bool isAdjacent = false;
+
+                        for (size_t k = 0; k < filteredCells.size(); ++k) {
+                            if (std::abs((int)current - (int)filteredCells[k]) <= 1) {
+                                isAdjacent = true;
+                                break;
+                            }
+                        }
+
+                        if (!isAdjacent) {
+                            filteredCells.push_back(current);
+                        }
+                    }
+
+                    // === แสดงผล cell ที่จะถูกบาลานซ์ ===
+                    Serial.println("------------------------------------------------");
+                    Serial.printf("Balancing Stack %d (Vmin=%.3f V | Vmax=%.3f V | Vdiff=%.3f V)\n",
+                        (int)i, extrema.vmin, extrema.vmax, diff);
+                    Serial.print("Selected Cells for Balancing: ");
+                    for (size_t idx : filteredCells) {
+                        Serial.printf("%d (%.3f V)  ", (int)idx, stack.cells[idx].voltage);
+                    }
+                    
+                    Serial.println();
+                    Serial.println("------------------------------------------------");
+
+                    // === เรียกฟังก์ชัน Balance ===
+                    if (!filteredCells.empty()) {
+                        uint8_t hexVal = voltageToHex(extrema.vmin+ VoltDiff_StopBalance);
+                        if (xSemaphoreTake(balanceMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            currentlyBalancingCells[i] = filteredCells;  // set สำหรับ stack i
+                            xSemaphoreGive(balanceMutex);
+                        }
+
+                        bms.BalanceCells(Manual, i, filteredCells, extrema.vminCells[0], hexVal);
+                    }
+                }
+            }
+        }
+    }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+
 void setup() {
-    // ---------------- config Pin Mode ----------------- //
-    pinMode(LED1, OUTPUT);  
-    pinMode(LED2, OUTPUT);   
-    pinMode(Relay, OUTPUT);
-
-    // ---------------- config Serial ------------------ //
     Serial.begin(115200);
-    mySerial.begin(1000000, SERIAL_8N1, 16, 17);
-    delay(100);
+    while (!Serial);
+    pinMode(LED1, OUTPUT);
+    pinMode(LED2, OUTPUT);
+    pinMode(Relay,OUTPUT);
+    pinMode(Nfault,INPUT);
 
-    // ------------ config BQ79600 & BQ79612 ---------- //
+    mySerial.begin(1000000, SERIAL_8N1, 16, 17);
     bms.initialize();
 
-    // ----------------- config FreeRTOS ----------------- //
-    bmsEventGroup = xEventGroupCreate();           // create  EventGroup
-    voltQueue = xQueueCreate(10, sizeof(float));   // create  Queue , size of float 10
-    xTaskCreate(GetdataTask, "ReadVolt", 2048, NULL, 1, NULL);  // create Task Read data
-    xTaskCreate(SendCanTask, "SendCAN", 2048, NULL, 1, NULL);    // create Task Send data to CAN
-    xTaskCreate(balanceTasdk, "Balance", 2048, NULL, 2, NULL);
+    dataMutex = xSemaphoreCreateMutex();
+    bmsEventGroup = xEventGroupCreate();
 
-    // ----------------- config MCP2515 CAN ----------------- //
     mcp2515.reset();
     mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
     mcp2515.setNormalMode();
+    bool start = false ;
+    while (!start){
+        if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+        if (command == "start") {
+            start = true;
+            Serial.println("Starting BMS...");
+            delay(1000);
+        }
+    }
+}
+    
+    xTaskCreate(GetdataTask, "ReadData", 4096, NULL, 1, NULL);
+   // xTaskCreate(SendCanTask, "SendCAN", 8192, NULL, 1, NULL);
+    xTaskCreate(balanceTask,  "Balance", 2048, NULL, 2, NULL);
+    xTaskCreate(FSMTask, "FSM", 4096, NULL, 2, NULL);
+
+    balanceMutex = xSemaphoreCreateMutex();
+    currentlyBalancingCells.resize(config.num_segments);  // ถ้ามี 6  ใส่ 6
+    attachInterrupt(digitalPinToInterrupt(Nfault), handleInterrupt, FALLING);
+
 }
 
 void loop() {
     
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    /*digitalWrite(Relay, LOW) ; // เปิดรีเลย์
-    digitalWrite(LED1, LOW) ;
-    digitalWrite(LED2, HIGH) ;
-    delay(1000);
-    digitalWrite(LED1, HIGH) ;
-    digitalWrite(LED2, LOW) ;
-    digitalWrite(Relay, HIGH) ; // ปิดรีเลย์
-    delay(1000);*/
-    /*if (Serial.available()) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-
-        if (command == "wake") {
-        
-            bms.wakeUp();
-
-        } else if (command == "initialize") {
-            Serial.println("Sending initialize command...");
-            bms.initialize();
-        } else if (command == "autoADDRESS") {
-            Serial.println("Sending autoADDRESS command...");
-            bms.AutoAddressing();
-        }else if (command == "off") {
-            Serial.println("Sending OFF command...");
-            bms.offcommand();
-        }else if (command == "cheakstatus") {
-            Serial.println("Sending cheakstatus command...");
-            bms.cheakstatus();
-        }else if (command == "Test") {
-            Serial.println("Sending Test command...");
-            bms.Test();
-        }else if (command == "ON") {
-            Serial.println("Sending ON GPIO command...");
-            bms.IronManON();
-        }else if (command == "OFF") {
-            Serial.println("Sending OFF GPIO command...");
-            bms.IronManOFF();
-        }else if (command == "cheakstatus1") {
-            Serial.println("Sending cheakstatus1 command...");
-            bms.cheakstatus1();
-        }else if (command == "ManualAddress") {
-            Serial.println("Sending Manual Address command...");
-                bool addrOk = bms.SetManualAddress(0x01, 100);
-                    if (!addrOk) {
-                        Serial.println("Error: ตั้งค่า Address ให้ BQ79612 ไม่สำเร็จ!");
-                    } else {
-                        Serial.println("Manual Address set successfully.");
-                    }
-        }else if (command == "ReadVoltCell"){
-            Serial.println("Sending ReadVoltCell command...");
-            //while (1)
-            //{
-                //bms.ReadVoltCell();
-                for (size_t stack = 0; stack < bms.cellDataMatrix.size(); ++stack) {
-                    for (size_t cell = 0; cell < bms.cellDataMatrix[stack].size(); ++cell) {
-                        Serial.print("Stack ");
-                        Serial.print(stack);
-                        Serial.print(" Cell ");
-                        Serial.print(cell);
-                        Serial.print(" Voltage: ");
-                        Serial.println(bms.cellDataMatrix[stack][cell].voltage, 4); // ปริ้น 4 ตำแหน่งทศนิยม
-                }
-            }
-                //delay(1000); // หน่วงเวลา 1 วินาที
-            //}
-            
-            
-        }else {
-            Serial.println("Unknown command: " + command);
-            }
-    }*/
-
-                //delay(1000); // หน่วงเวลา 1 วินาที
 }
 
-VoltageExtrema AnalyzeVoltageStats(const std::vector<StackData>& batteryData_pack) {
-    VoltageExtrema result;
-    result.vmin = std::numeric_limits<float>::max();
-    result.vmax = std::numeric_limits<float>::lowest();
-    result.vminStack = result.vmaxStack = 0;
-    result.vminCell  = result.vmaxCell  = 0;
+std::vector<StackVoltageExtrema> AnalyzePerStackStats(const std::vector<StackData>& batteryData_pack) {
+    std::vector<StackVoltageExtrema> result;
 
-    for (size_t stackIdx = 0; stackIdx < batteryData_pack.size(); ++stackIdx) {
-        const StackData& stack = batteryData_pack[stackIdx];
-        if (stack.cells.empty()) continue;
+    for (size_t stackIndex = 0; stackIndex < batteryData_pack.size(); ++stackIndex) {
+        const StackData& stack = batteryData_pack[stackIndex];
+
+        StackVoltageExtrema extrema;
+        extrema.vmin = std::numeric_limits<float>::max();
+        extrema.vmax = std::numeric_limits<float>::lowest();
+        float totalVoltage = 0.0f;
+        Serial.printf("=== Stack %d ===\n", (int)stackIndex);
+        Serial.println("Cell Voltages:");
 
         for (size_t i = 0; i < stack.cells.size(); ++i) {
             float v = stack.cells[i].voltage;
+            totalVoltage += v;
+            Serial.printf("  Cell %2d: %.3f V\n", (int)i, v);
 
-            if (v < result.vmin) {
-                result.vmin = v;
-                result.vminStack = stackIdx;
-                result.vminCell = i;
+            if (v < extrema.vmin) {
+                extrema.vmin = v;
+                extrema.vminCells.clear();
+                extrema.vminCells.push_back(i);
+            } else if (v == extrema.vmin) {
+                extrema.vminCells.push_back(i);
             }
-            if (v > result.vmax) {
-                result.vmax = v;
-                result.vmaxStack = stackIdx;
-                result.vmaxCell = i;
+
+            if (v > extrema.vmax) {
+                extrema.vmax = v;
+                extrema.vmaxCells.clear();
+                extrema.vmaxCells.push_back(i);
+            } else if (v == extrema.vmax) {
+                extrema.vmaxCells.push_back(i);
             }
         }
-    }
 
-    // Optional: แสดงผล
-    Serial.println("========== PACK SUMMARY ==========");
-    Serial.printf("Overall Vmin: %.4f V at Stack %d Cell %d\n", result.vmin, result.vminStack, result.vminCell);
-    Serial.printf("Overall Vmax: %.4f V at Stack %d Cell %d\n", result.vmax, result.vmaxStack, result.vmaxCell);
+        // พิมพ์ค่าเฉลี่ย
+        float averageVcell = totalVoltage / stack.cells.size();
+        extrema.averageVcell = averageVcell;
+        Serial.printf("Average Vcell: %.3f V\n", averageVcell);
+
+        // แสดงค่า Max / Min
+        Serial.printf("Vmin: %.3f V [cells:", extrema.vmin);
+        for (size_t idx : extrema.vminCells) {
+            Serial.printf(" %d", (int)idx);
+        }
+        Serial.print(" ] | ");
+
+        Serial.printf("Vmax: %.3f V [cells:", extrema.vmax);
+        for (size_t idx : extrema.vmaxCells) {
+            Serial.printf(" %d", (int)idx);
+        }
+        Serial.println(" ]\n");
+
+        result.push_back(extrema);
+        
+
+        //----------------------- show CellTemp -----------------------------//
+        //Serial.printf("gpioTemps size = %d\n", stack.gpioTemps.size());
+        Serial.println(" ---------------- Temp ----------------- ");
+        for(int CellTemp = 0 ; CellTemp < stack.gpioTemps.size(); CellTemp++) {
+            if (CellTemp >= 2) break; // แสดงแค่ 2 ค่าแรก
+            Serial.printf("GPIO Temp %d: %.3f C\n", CellTemp, stack.gpioTemps[CellTemp]);
+        }
+        Serial.printf("Die Temp %d: %.3f C\n",stackIndex ,stack.dieTemp);
+        
+        Serial.println(" ------------------------------------ ");
+        
+    }
 
     return result;
 }
+
 uint8_t voltageToHex(float Vmin) {
-    // Clamp input range
-    if (Vmin < 2.45) Vmin = 2.45;
-    if (Vmin > 4.00) Vmin = 4.00;
-
-    // Calculate step value
-    uint8_t step = round((Vmin - 2.45) / 0.025) + 1;
-
-    // Clamp output to valid range: 0x01 to 0x3F (1 to 63)
-    if (step < 1) step = 1;
+    if (Vmin < 2.45f) Vmin = 2.45f;
+    if (Vmin > 4.00f) Vmin = 4.00f;
+    int step = round((Vmin - 2.45f) / 0.025f) + 1;
+    if (step < 1)  step = 1;
     if (step > 63) step = 63;
-
     return (uint8_t)step;
+}
+
+void checkStatus() {
+    if(interruptTriggered) {
+        currentState = Fault; 
+        interruptTriggered = false;   
+    }
+}
+
+void handleFault(){
+    Serial.println("Entering Fault Handler...");
+
+    while (!clearAllFaults()) {
+        Serial.println("Waiting for fault to clear...");
+        vTaskDelay(pdMS_TO_TICKS(1000));  // รอ 1 วินาที
+    }
+
+    Serial.println("All faults cleared.");
+    currentState = Main;
+}
+
+bool clearAllFaults() {
+    bool stillFault = false;
+
+    if (bms.checkFaultBase()) {
+        bms.clearFault();
+        Serial.println("Cleared base fault");
+        stillFault = true;
+    }
+
+    if (bms.checkFaultBrigh()) {
+        bms.clearFault();
+        Serial.println("Cleared brigh fault");
+        stillFault = true;
+    }
+
+    return !stillFault;  // ถ้าไม่มี fault เลย -> true
 }
