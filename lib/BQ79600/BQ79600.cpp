@@ -6,22 +6,28 @@ BQ79600::BQ79600(HardwareSerial &serial, uint32_t baud, int tx_pin, BQ79600confi
     NumSegments(config.num_segments),
     NumCellsSeries(config.num_cells_series),
     NumThermistors(config.num_thermistors),
-    ShuntResistance(config.shunt_resistance)
+    ShuntResistance(config.r_shunt)
 {
     data_arr_.resize(20);
 }
 
-void BQ79600::initialize() {
+bool BQ79600::initialize() {
+    bool autoAddressed = false;
     wakeUp();                                           // Wake up the BQ79600  and BQ79612
-    AutoAddressing();                                   // Auto address the BQ79600 devices
-    
+    autoAddressed = AutoAddressing();                                   // Auto address the BQ79600 devices
+    data_arr_[0] = 0x56 ; //  COMM_TIMEOUT config
+    sendCommandTo(RequestType::SingleWrite, 1, DEV_ADDR, RegisterAddress::COMM_TIMEOUT ,data_arr_);  
     config_MainADC(NumCellsSeries,NumSegments);         // Configure the main ADC 
     //config_AuxADC() ;                                    // Configure the aux ADC
     config_Fault();                                     // Configure the fault settings
     config_OT_UT();                                     // Configure the Over Temperature and Under Temperature settings
-    config_OV_UV();                                     // Configure the Over Voltage and Under Voltage settings
+    config_OV_UV();    
+    if (autoAddressed){
+        return true; // Auto addressing successful
+    }else if(!autoAddressed){
+        return false; // Auto addressing failed
+    }
     
-
 }
 
 void BQ79600::beginUart()
@@ -36,7 +42,7 @@ void BQ79600::wakeUp() {
     delay(5);
     beginUart();
     sendCommandTo(RequestType::SingleWrite, 1, DEV_ADDR , RegisterAddress::CONTROL1,{0x20});   // Send WAKE tone up the stack bq79612
-    delay(5);
+    delay(5); // tAFE_SETTLE 4 ms
 }
 
 void BQ79600::wakePing() {
@@ -92,6 +98,13 @@ void BQ79600::config_MainADC(uint8_t numcell,uint8_t numStack) {
         Serial.println("Invalid numcell: must be between 6 and 16");
         return;
     }
+     //----------------------------- reset MAIN ADC --------------------------------------------------///
+    Serial.println("");
+    Serial.println(" Reset LPF_BB_EN, LPF_VCELL,MAIN_MODE command  ");
+    data_arr_[0] = 0x00 ; //  reset LPF_BB_EN, LPF_VCELL ,MAIN_MODE
+    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL1 ,data_arr_);   // Stop ADC
+    delayMicroseconds(3500);    
+    
     // ---------- configure enable TSREF ---------- //
     Serial.println("");
     Serial.println(" Set configure enable TSREF command ");
@@ -108,7 +121,7 @@ void BQ79600::config_MainADC(uint8_t numcell,uint8_t numStack) {
     // set GPIO 1,2 
     Serial.println("");
     Serial.println(" Set GPIO 1,2 command ");
-    data_arr_[0] = 0x01 ; //  Configures GPIO1 ,GPIO2  
+    data_arr_[0] = 0x00 ; //  Configures GPIO1 ,GPIO2  0x09
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::GPIO_CONF1 ,data_arr_);
 
     // set GPIO 3,4 
@@ -136,27 +149,20 @@ void BQ79600::config_MainADC(uint8_t numcell,uint8_t numStack) {
     uint8_t delayCode = calcADC_DLY(numStack);
     data_arr_[0] = delayCode; //  ADC delay code
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CONF2 ,data_arr_);
-    
+
     // set  Configures the post ADC low-pass & Configures the post main SAR ADC low-pass filter cut-off frequency for BBP/N
     Serial.println("");
     Serial.println(" Configures low-pass filter cut-off frequency command ");
     data_arr_[0] = 0b00000000 ; 
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CONF1 ,data_arr_);
 
-    //----------------------------- reset MAIN ADC --------------------------------------------------///
-    Serial.println("");
-    Serial.println(" Reset LPF_BB_EN, LPF_VCELL,MAIN_MODE command  ");
-    data_arr_[0] = 0x00 ; //  reset LPF_BB_EN, LPF_VCELL ,MAIN_MODE
-    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL1 ,data_arr_);   // START ADC
-    delayMicroseconds(3500);    //  wait for ADC to start 
-
-    //----------------------------- start MAIN ADC --------------------------------------------------///
+        //----------------------------- start MAIN ADC --------------------------------------------------///
     Serial.println("");
     Serial.println(" Set LPF_BB_EN, LPF_VCELL,MAIN_MODE command  ");
     Serial.println("Start ReadMainADC ");
-    data_arr_[0] = 0x05 ; //  LPF_BB_EN, LPF_VCELL ,MAIN_MODE
+    data_arr_[0] = 0x0E ; //  LPF_BB_EN, LPF_VCELL ,MAIN_MODE
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL1 ,data_arr_);   // START ADC
-    //delayMicroseconds(3500);    //  wait for ADC to start 
+    delayMicroseconds(3500);    //  wait for ADC to start 
     delayMicroseconds(192*8);   //  wait for ADC finished 
 }  
 void BQ79600::config_AuxADC() {
@@ -168,27 +174,20 @@ void BQ79600::config_AuxADC() {
     // ---------- configure Selects GPIO AUX  ---------- //
     data_arr_[0] = 0x06; // Run all active GPIO channels set by GPIO_CONF register
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL3 ,data_arr_);
-    
-    //delayMicroseconds(3500);    //  wait for ADC to start 
     delayMicroseconds(192*8);   //  wait for ADC finished 
 }
 void BQ79600::BalanceCells(uint8_t mode, size_t stack, const std::vector<size_t>& targetCells, size_t preservedCell, uint8_t hexThreshold){
     bool ok;
-
+    
      // optional: stop cell voltage Threshold for balancing
     data_arr_[0] = hexThreshold; 
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::VCB_DONE_THRESH , data_arr_);
-    data_arr_[0] = 0x02; // Run the OV and UV round robin and Go
-    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::OVUV_CTRL , data_arr_);
-
-    // determine the balaneing channels
-    data_arr_[0] = 0x02; //  seting time of balancing  10 s
-
+    
     for (int i = 0; i < NumCellsSeries; i++) {
     RegisterAddress reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::CB_CELL1_CTRL) - i );
 
         if (std::find(targetCells.begin(), targetCells.end(), i) != targetCells.end() && i != preservedCell) {
-            data_arr_[0] = 0x04;  // 
+            data_arr_[0] = 0x04;  //  300 seconds 0x04
             //Serial.printf(" → Balancing ON  | Cell Index %2d (Reg 0x%04X)\n", i, reg);
         } else {
             data_arr_[0] = 0x00;  // cell นี้ไม่ต้องทำ balancing
@@ -199,15 +198,15 @@ void BQ79600::BalanceCells(uint8_t mode, size_t stack, const std::vector<size_t>
     }
 
     // setting duty cycle if auto balancing is used
-    data_arr_[0] = 0x01;  // seting time of balancing  10 s
+    data_arr_[0] = 0x04;  // seting time of balancing  60 s
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::BAL_CTRL1 , data_arr_);
 
-    /* // setting for on one or two CBFED  
+    // setting for on one or two CBFED  
     data_arr_[0] = 0x14; 
-    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::DEV_CONF , data_arr_); */
+    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::DEV_CONF , data_arr_); 
+
     // configures mode of OV/UV detection  
-    
-    data_arr_[0] = 0x05; // Run the OV and UV round robin and Go
+    data_arr_[0] = 0x05; // Run the OV and UV round robin and Go again
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::OVUV_CTRL , data_arr_);
     
     // determine the method of balancing
@@ -215,20 +214,22 @@ void BQ79600::BalanceCells(uint8_t mode, size_t stack, const std::vector<size_t>
     
     if(mode == 1) {
         data_arr_[0] = data_arr_[0] |(1<<0); //  Configures the balancing Auto method to be used
-        Serial.println("Balancing mode: Auto"); 
+        Serial.println("Balancing mode Auto"); 
     }else{
-        Serial.println("Balancing mode: manaul"); 
+        Serial.println("Balancing mode manaul"); 
     }
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::BAL_CTRL2 , data_arr_); 
+    delay(1);
+    
 }
 
 
 void BQ79600::config_OV_UV(){
     //  Configures the overvoltage and undervoltage thresholds 
-    data_arr_[0] = 0x23; //  Set the overvoltage threshold
+    data_arr_[0] = 0x23; //  Set the overvoltage threshold 4.2 V
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::OV_THRESH , data_arr_);
     
-    data_arr_[0] = 0x00; //  Set the undervoltage threshold 
+    data_arr_[0] = 0x00; //  Set the undervoltage threshold 3.1V
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::UV_THRESH , data_arr_);
     
      // optional: stop cell voltage Threshold for balancing
@@ -250,7 +251,7 @@ void BQ79600::config_OV_UV(){
 }
 void BQ79600::config_OT_UT(){
     // Configures the overtemperature and undertemperature thresholds
-    data_arr_[0] = 0x00;
+    data_arr_[0] = 0b11100000; //  
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::OTUT_THRESH , data_arr_); 
 
     /* // Configures the overtemperature and undertemperature thresholds for run again
@@ -269,118 +270,119 @@ void BQ79600::config_Fault(){
     // Configures BQ79600 and BQ79612 enable NFAULT , FCOMM_EN , HB_TX_EN ,FTO_EN
     data_arr_[0] = 0x57; //  Enable NFAULT , FCOMM_EN , HB_TX_EN , FTO_EN 
     sendCommandTo(RequestType::BroadcastWrite, 1, DEV_ADDR, RegisterAddress::DEV_CONF , data_arr_);
-
     
 }
-
-
     
-void BQ79600::ReadVoltCellandTemp() {
-    std::vector<std::vector<double>> die_temp;
-    std::vector<std::vector<double>> temp;
-    std::vector<std::vector<double>> voltages;
-    std::vector<double> TSREF;
+void BQ79600::get_data() {
+    std::vector<std::vector<double>> voltages, temp;
+    std::vector<double> TSREF,busbar,die_temp;
     RegisterAddress reg;
     bool ok;
-    bool cheak = false; 
-    //------------------------- go Main ADC ----------------------------- //
-    data_arr_[0] = 0x05 ; //  LPF_BB_EN, LPF_VCELL ,MAIN_MODE
-    sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL1 ,data_arr_);   // START ADC
-    delay(200);
-    /* while(!cheak) {
-        delay(5);
-        cheak = ReadMainADC(); //  read Main ADC
-        if (cheak) {
-            Serial.println("Read Main ADC done");
-            cheak = true; // exit the loop
-        } else {
-            Serial.println("wait for Read Main ADC done 8 round robin");
-        }
-    } */
-    // --------------------------- Read Vcell --------------------------- //
-    /* Serial.println("");
-    Serial.println("READ CELL VOLTAGE from register "); */
-    data_arr_[0] = (NumCellsSeries * 2) - 1;
-    reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::VCELL16_HI) + (16 - NumCellsSeries) * 2);
-    ok = this->sendAndReceive(RequestType::StackRead, (NumCellsSeries * 2), DEV_ADDR, reg, data_arr_, response); 
-    voltages = parseCellVoltages(response, NumSegments, NumCellsSeries);
+    
+    // เตรียม buffer
+    voltageBuffer.resize(NumSegments);
+    gpioTempBuffer.resize(NumSegments);
+    dieTempBuffer.resize(NumSegments);
+    busbarBuffer.resize(NumSegments);
+    for (int s = 0; s < NumSegments; ++s) {
+        voltageBuffer[s].resize(NumCellsSeries);
+        gpioTempBuffer[s].resize(NumThermistors);
+    } 
 
-    // --------------------------- Read TSREF --------------------------- //
-    /* Serial.println("");
-    Serial.println("READ TSREF VOLTAGE from register "); */
-    data_arr_[0] = 0x01; // 2 byte for TSREF
-    ok = this->sendAndReceive(RequestType::StackRead, 2, DEV_ADDR,RegisterAddress:: TSREF_HI, data_arr_, response); 
-    TSREF = parseTSREF(response, NumSegments);
-    // --------------------------- Read GPIO Temp --------------------------- //
-    /* Serial.println("");
-    Serial.println(" READ Temp from register "); */
-    data_arr_[0] = (NumThermistors * 2) - 1;
-    reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::GPIO1_HI));
-    ok = this->sendAndReceive(RequestType::StackRead, (NumThermistors * 2), DEV_ADDR, reg, data_arr_, response);
-    temp = parseTemp(response,TSREF,NumSegments, NumThermistors);
+    // อ่านค่าเฉลี่ยหลายรอบ
+    for (int round = 0; round < averageWindow; ++round) {
+        
+        // Read Voltages
+        data_arr_[0] = (NumCellsSeries * 2) - 1;
+        reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::VCELL16_HI) + (16 - NumCellsSeries) * 2);
+        ok = sendAndReceive(RequestType::StackRead, NumCellsSeries * 2, DEV_ADDR, reg, data_arr_, response);
+        voltages = parseCellVoltages(response, NumSegments, NumCellsSeries);
 
-    // --------------------------- Read Die Temp --------------------------- //
-    /* Serial.println("");
-    Serial.println(" READ die Temp from register "); */
-    data_arr_[0] = 0x01;
-    reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::DIETEMP1_HI));
-    ok = this->sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, reg, data_arr_, response);
-    die_temp = parsedie_Temp(response, NumSegments); 
+        // Read TSREF
+        data_arr_[0] = 0x01;
+        ok = sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, RegisterAddress::TSREF_HI, data_arr_, response);
+        TSREF = parseTSREF(response, NumSegments);
 
-    // --------------------------- Map to struct --------------------------- //
-    if (ok) {
-        batteryData_pack.clear();  // clear previous data
-        batteryData_pack.resize(NumSegments);
+        // Read busbar Voltage
+        data_arr_[0] = 0x01;
+        ok = sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, RegisterAddress::BUSBAR_HI, data_arr_, response);
+        
+        busbar = parseBUSBAR(response, NumSegments);
+        Serial.print("busbar Voltage FA:");
+        Serial.println(busbar[0]); 
 
+        // Read GPIO Temp
+        data_arr_[0] = (NumThermistors * 2) - 1;
+        reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::GPIO1_HI));
+        ok = sendAndReceive(RequestType::StackRead, NumThermistors * 2, DEV_ADDR, reg, data_arr_, response);
+        temp = parseTemp(response, TSREF, NumSegments, NumThermistors);
 
+        // Read Die Temp
+        data_arr_[0] = 0x01;
+        reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::DIETEMP1_HI));
+        ok = sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, reg, data_arr_, response);
+        die_temp = parsedie_Temp(response, NumSegments);
+
+        // เก็บค่าใส่ buffer
         for (uint8_t stack = 0; stack < NumSegments; ++stack) {
-            StackData& currentStack = batteryData_pack[stack];
-            currentStack.cells.resize(NumCellsSeries);
-            // --- set voltage per cell --- //
-            
             for (uint8_t cell = 0; cell < NumCellsSeries; ++cell) {
-                
-                currentStack.cells[cell].voltage = voltages[stack][NumCellsSeries - 1 - cell];
+                float v = voltages[stack][NumCellsSeries - 1 - cell];
+                auto& hist = voltageBuffer[stack][cell];
+                hist.push_back(v);
+                if (hist.size() > averageWindow) hist.pop_front();
             }
 
-             // --- set GPIO temps (stack level) --- //
-            currentStack.gpioTemps.resize(NumThermistors);
-            for (uint8_t num = 0; num < NumThermistors; ++num) {
-                currentStack.gpioTemps[num] = temp[stack][num];
-                
+            for (uint8_t t = 0; t < NumThermistors; ++t) {
+                float tval = temp[stack][t];
+                auto& hist = gpioTempBuffer[stack][t];
+                hist.push_back(tval);
+                if (hist.size() > averageWindow) hist.pop_front();
             }
 
-            // --- set die temp --- //
-            if (stack < die_temp.size() && die_temp[stack].size() > 0) {
-                currentStack.dieTemp = die_temp[stack][0];
-            } else {
-                Serial.printf("Warning: die_temp[%d] is empty!\n", stack);
-                currentStack.dieTemp = -999; // หรือค่า default/error อื่น
-            } 
-        }
+            float dtemp = (stack < die_temp.size()) ? die_temp[stack] : -999;
+            auto& dhist = dieTempBuffer[stack];
+            dhist.push_back(dtemp);
+            if (dhist.size() > averageWindow) dhist.pop_front();
 
-    } else {
-        Serial.println("Failed to read volt cell!");
-    }  
-}
-bool BQ79600::ReadMainADC(){
-    data_arr_[0] = 0x00; //  
-    sendCommandTo(RequestType::SingleRead, 1, 0x01, RegisterAddress::ADC_STAT1 ,data_arr_);   // START ADC
-    if(response[4] & 0x01){
-        Serial.println("ADC_STAT1: ADC is done!");
-        return true; // ADC is still busy
-    }else{
-        Serial.println("ADC_STAT1: wait ADC complete....");
-        return false;
+            if (stack == NumSegments - 1) {
+                float bvolt = (stack < busbar.size()) ? busbar[stack] : -999;
+                auto& bhist = busbarBuffer[stack];  
+                bhist.push_back(bvolt);
+                if (bhist.size() > averageWindow) bhist.pop_front();
+            }
+            
+        
+        } 
+        
     }
     
-}
-std::vector<std::vector<double>> BQ79600::parsedie_Temp( const std::vector<byte>& response, uint8_t numStacks){
+    // คำนวณค่าเฉลี่ยเพื่อใส่ใน batteryData_pack
+    batteryData_pack.clear();
+    batteryData_pack.resize(NumSegments);
 
-    std::vector<std::vector<double>> die_temp(numStacks);
+    for (uint8_t stack = 0; stack < NumSegments; ++stack) {
+        StackData& currentStack = batteryData_pack[stack];
+        currentStack.cells.resize(NumCellsSeries);
+        for (uint8_t cell = 0; cell < NumCellsSeries; ++cell){
+            currentStack.cells[cell].voltage = calcAverage(voltageBuffer[stack][cell]);
+        }
+        currentStack.gpioTemps.resize(NumThermistors);
+        for (uint8_t t = 0; t < NumThermistors; ++t){
+            currentStack.gpioTemps[t] = calcAverage(gpioTempBuffer[stack][t]);
+        }
+        currentStack.dieTemp = calcAverage(dieTempBuffer[stack]);
+        currentStack.busbarVolt = calcAverage(busbarBuffer[stack]);
+    }
+    /* Serial.print("busbarVolt: ");
+    Serial.println(batteryData_pack[NumSegments - 1].busbarVolt); */
+}
+
+std::vector<double> BQ79600::parsedie_Temp( const std::vector<byte>& response, uint8_t numStacks){
+
+    std::vector<double> die_temp(numStacks);
     const size_t frameHeaderSize = 4;
     const size_t crcSize = 2;
-    const size_t dataSizePerStack = 1 ;
+    const size_t dataSizePerStack = 2 ;
     const size_t frameSize = frameHeaderSize + dataSizePerStack + crcSize;
     if (response.size() < frameSize * numStacks) {
         Serial.println("Response size too small!");
@@ -395,9 +397,10 @@ std::vector<std::vector<double>> BQ79600::parsedie_Temp( const std::vector<byte>
 
             uint16_t raw = (response[index] << 8) | response[index + 1];
             double Temp = convertTo_dietemp(raw);
-            //Serial.println(Temp);
+            Serial.print("DieTemp:");
+            Serial.println(Temp);
 
-            die_temp[stack].push_back(Temp);
+            die_temp[0] = Temp ;
         
     }
 
@@ -414,6 +417,7 @@ std::vector<std::vector<double>> BQ79600::parseTemp( const std::vector<byte>& re
     int R1 =  10000; // 10k ohm
     float B = 3977;
     float T0 = 25.0 + 273.15;
+    uint16_t raw[2];
     
 
     if (response.size() < frameSize * numStacks) {
@@ -421,28 +425,29 @@ std::vector<std::vector<double>> BQ79600::parseTemp( const std::vector<byte>& re
         return Temp; // early return with empty or partial vector
     }
     for (uint8_t stack = 0; stack < numStacks; ++stack) {
-        size_t base = stack * frameSize;
-
-        for (uint8_t num = 0; num < numNTC; ++num) {
-            size_t index = base + frameHeaderSize + num * 2;
+            
+        size_t index =  frameHeaderSize + (stack * frameSize) ;
 
             if (index + 1 >= response.size()) {
                 Serial.println("Index out of bounds in parseTemp!");
                 continue;
             }
 
-            uint16_t raw = (response[index] << 8) | response[index + 1];
-            double GPIO_Volt = convertTo_VoltGPIO(raw); 
-            double Rntc =  (GPIO_Volt*R1 / (5 - GPIO_Volt));
-            double lnR = log(Rntc / R1);
-            double Temp_K = 1.0 / ((lnR / B) + (1.0 / T0));
-            double GPIO_Temp = Temp_K - 273.15;
+            raw[0] = (response[index] << 8) | response[index + 1];
+            raw[1] = (response[index + 2] << 8) | response[index + 3];
+            
 
-            Temp[stack][num] = GPIO_Temp;
-            Serial.println(GPIO_Temp);
-            Serial.println(TSREF[stack]);
-            Serial.println(GPIO_Volt); 
-        }
+            for (uint8_t num = 0; num < numNTC ; num++){
+                double GPIO_Volt = convertTo_VoltGPIO(raw[num]); 
+                double Rntc =  (GPIO_Volt*R1 / (5 - GPIO_Volt));
+                double lnR = log(Rntc / R1);
+                double Temp_K = 1.0 / ((lnR / B) + (1.0 / T0));
+                double GPIO_Temp = Temp_K - 273.15;
+                Temp[stack][num] = GPIO_Temp;
+                Serial.printf("GPIO_Temp %d = ", num);
+                Serial.println(Temp[stack][num]);
+            }
+        
     }
 
     return Temp;
@@ -452,7 +457,7 @@ std::vector<double> BQ79600::parseTSREF( const std::vector<byte>& response, uint
     std::vector<double> TSREF(numStacks);
     const size_t frameHeaderSize = 4;
     const size_t crcSize = 2;
-    const size_t dataSizePerStack = 1 ;
+    const size_t dataSizePerStack = 2 ;
     const size_t frameSize = frameHeaderSize + dataSizePerStack + crcSize;
     if (response.size() < frameSize * numStacks) {
         Serial.println("Response size too small!");
@@ -467,14 +472,42 @@ std::vector<double> BQ79600::parseTSREF( const std::vector<byte>& response, uint
 
             uint16_t raw = (response[index] << 8) | response[index + 1];
             double TSREF_volt = convertTo_TREFVolt(raw);
-            /* Serial.println("TSREF_volt");
-            Serial.println(TSREF_volt); */
-
             TSREF.push_back(TSREF_volt);
         
     }
 
     return TSREF;
+}
+std::vector<double> BQ79600::parseBUSBAR( const std::vector<byte>& response, uint8_t numStacks){
+
+    std::vector<double> BUSBAR(numStacks);
+    const size_t frameHeaderSize = 4;
+    const size_t crcSize = 2;
+    const size_t dataSizePerStack = 2 ;
+    const size_t frameSize = frameHeaderSize + dataSizePerStack + crcSize;
+    if (response.size() < frameSize * numStacks) {
+        Serial.println("Response size too small!");
+        return BUSBAR; // early return with empty or partial vector
+    }
+    for (uint8_t stack = 0; stack < numStacks; ++stack) {
+        size_t index = frameHeaderSize+(stack * frameSize) ;
+            if (index + 1 >= response.size()) {
+                Serial.println("Index out of bounds in BUSBAR!");
+                continue;
+            }
+
+            uint16_t raw = (response[index] << 8) | response[index + 1];
+            Serial.print("busbar Voltage:");
+            Serial.println(raw);
+            double BUSBAR_volt = convertTo_BUSBARVolt(raw)*1000; // mV
+            Serial.print("busbar VoltageA:");
+            Serial.println(BUSBAR_volt);
+            BUSBAR[stack] = BUSBAR_volt;
+    //BUSBAR.push_back(BUSBAR_volt);
+            
+    }
+
+    return BUSBAR;
 }
 
 std::vector<std::vector<double>> BQ79600::parseCellVoltages( const std::vector<byte>& response, uint8_t numStacks, uint8_t numCells) {
@@ -510,6 +543,7 @@ std::vector<std::vector<double>> BQ79600::parseCellVoltages( const std::vector<b
     return voltages;
 } 
 
+
 double BQ79600::convertTo_VoltagCell(uint16_t rawValue) {
     int16_t signed_value = static_cast<int16_t>(rawValue);
     return signed_value * 190.73e-6;
@@ -535,6 +569,19 @@ double BQ79600::convertTo_TREFVolt(uint16_t rawValue) {
     
 }
 
+double BQ79600::convertTo_BUSBARVolt(uint16_t rawValue) {
+    int16_t signed_value = static_cast<int16_t>(rawValue);
+    return signed_value * 30.52e-6;
+    
+}
+
+float BQ79600::calcAverage(const std::deque<float>& history) {
+    if (history.empty()) return 0.0f;
+    float sum = 0;
+    for (auto val : history) sum += val;
+    return sum / history.size();
+}
+
 
 uint8_t BQ79600::calcADC_DLY(uint8_t numDevices) {
     float afeSettle = 4000.0f ;
@@ -543,7 +590,7 @@ uint8_t BQ79600::calcADC_DLY(uint8_t numDevices) {
     uint8_t code       = uint8_t(totalDelay / 5.0f + 0.5f); // ปัดขึ้น
     return (code <= 40) ? code : 40;  // จำกัด 0–40
 }
-void BQ79600::AutoAddressing(){
+bool BQ79600::AutoAddressing(){
     bool ok ;
     stack_size_ = NumSegments ;
     // ----- step 1: Write 0x00 to OTP_ECC_DATAIN registers 
@@ -586,6 +633,7 @@ void BQ79600::AutoAddressing(){
         Serial.print("Stack device address verification from 0x306: ");
     } else {
         Serial.println("Failed to read from address 0x306");
+        return false;
     }
 
     // ----- step 8:  single device read to BQ79600-Q1, verify 0x2001 = 0x14
@@ -593,12 +641,15 @@ void BQ79600::AutoAddressing(){
     if (ok) {
         if (response[4] == 0x14) {
             Serial.println("Verification Passed: Address 0x2001 = 0x14");
+            return true;
             
         } else {
             Serial.println("Verification Failed: Address 0x2001 not equal to 0x14");
+            return false;
         }
     } else {
         Serial.println("Failed to read from address 0x2001");
+        return false;
     }
     
 
@@ -645,11 +696,10 @@ bool BQ79600::receiveResponse(std::vector<byte>& response, size_t expected_size,
     return false;
 }
 bool BQ79600::receiveStackResponse(std::vector<byte>& response, size_t device_count, size_t data_per_device, unsigned long timeout_ms) {
-    //beginUart();
+    
     response.clear();
     resp_data.clear();
-    //response.resize(device_count*data_per_device);
-    //resp_data.resize(20);
+    
     if (!uart) {
         Serial.println("UART not initialized.");
         return false;
@@ -678,12 +728,7 @@ bool BQ79600::receiveStackResponse(std::vector<byte>& response, size_t device_co
                 }
             }
         }
-        /* Serial.print("frame ");
-        for(int k = 0; k < frame.size(); k++) {
-            Serial.print(frame[k], HEX);
-            Serial.print(" ");
-        }
-        Serial.println(" "); */
+        
         // Check if frame is incomplete (timeout case)
         if (frame.size() != expected_frame_size) {
             Serial.print("Timeout or incomplete frame at device ");
@@ -691,13 +736,7 @@ bool BQ79600::receiveStackResponse(std::vector<byte>& response, size_t device_co
             return false;
         }
     }
-    /* Serial.println("response: ");
-    for(int i =0; i < device_count*(4+data_per_device+2) ; i++) {
-            Serial.print(response[i ], HEX);  // response[] is the first data byte
-            Serial.print(" ");
-        }
-    Serial.println();
-    Serial.println("All stack responses received successfully."); */
+    
     return true;
 }
 
@@ -785,70 +824,19 @@ void BQ79600::IronManOFF(){
     sendCommandTo(RequestType::BroadcastWrite, 1, DEV_ADDR, RegisterAddress::GPIO_CONF2 , data_arr_); 
 }
 
-bool BQ79600::cheakBalance (){
-    
-
-    bool K = true ;
-    
-    /* data_arr_[0] = 0x00;
-    Serial.println("data CUST_CRC_HI");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_HI, data_arr_, response);
-
-    Serial.println("data CUST_CRC_LO ");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_LO , data_arr_, response);
-
-    Serial.println("data CUST_CRC_RSLT_HI");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_RSLT_HI, data_arr_, response);
-
-    Serial.println("data CUST_CRC_RSLT_LO ");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_RSLT_LO , data_arr_, response);
-    Serial.println("");  */
-    /////////////////////////////////////////////////////////
-    //Serial.println("send data CUST_CRC_HI");
-    data_arr_[0] = 0x21; 
-    sendCommandTo(RequestType::SingleWrite, 2, 0x01, RegisterAddress::CUST_CRC_HI, data_arr_);
-    //Serial.println("send CUST_CRC_LO ");
-    sendCommandTo(RequestType::SingleWrite, 1, 0x01,RegisterAddress::CUST_CRC_LO , data_arr_);
-    K = cheakFaultbase();
-    if(K){
-        Serial.println(" Clear Fault "); 
-        clearFault();
-    }
-    
+int BQ79600::cheakBalance (){
+    int result ;
+    delay(100);  
+    data_arr_[0] = 0x21;    
     Serial.println(" data BAL_STAT"); 
     data_arr_[0] = 0x00; 
     bool ok = sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::BAL_STAT, data_arr_, response);
-    if(ok){
-        
-        if (response[4] & 0x80){
-            Serial.println("Invalid CB setting");
-            Serial.println("Go to balance required");
-            return false;
-        }else if (response[4] & 0x40){
-            Serial.println("NTC thermistor measurement is greater than OTCB_THR OR CBFET temp  is greater than CB TWARN");
-            return false;
-        }else if (response[4] & 0x20){
-            Serial.println("cell balancing pause status");
-            return true;
-        }else if (response[4] & 0x10){
-            Serial.println("Module balancing");
-            return true;
-        }else if (response[4] & 0x08){
-            Serial.println("At least 1 cell is in active cell balancing");
-            return true;
-        }else if (response[4] & 0x04){
-            Serial.println(" fault detect");
-            return false;
-        }else if (response[4] & 0x02){
-            Serial.println("Module balancing completed");
-            return false;
-        }else {
-            Serial.println(" All cell balancing is completed");
-            return false;
-        }
+    if(!ok){
+        Serial.println(" MissData");    
     }
-    return false;
+    return result = response[4] ;
 }
+
 bool BQ79600::checkFaultBase (){
     
     Serial.println("");
@@ -876,6 +864,10 @@ bool BQ79600::checkFaultBase (){
             return true;
         }else if (response[4] & 0x04){
             Serial.println("FAULT_OVUV");
+            FAULT_OV1();
+            FAULT_OV2();
+            FAULT_UV1();
+            FAULT_UV2();
             return true;
         }else if (response[4] & 0x02){
             Serial.println("FAULT_SYS");
@@ -884,39 +876,10 @@ bool BQ79600::checkFaultBase (){
             Serial.println("FAULT_PWR");
             return true;
         }
-        
-        
         Serial.println("-----------------------------------");
         Serial.println("");
     return true ;
-    /* Serial.println("    ");
-    Serial.println("FAULT_OTP Fault");
-    data_arr_[0] = 0x00; 
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::FAULT_OTP, data_arr_, response);  
-
-    Serial.println("data CUST_CRC_HI");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_HI, data_arr_, response);
-
-    Serial.println("data CUST_CRC_LO ");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_LO , data_arr_, response);
-
-    Serial.println("data CUST_CRC_RSLT_HI");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_RSLT_HI, data_arr_, response);
-
-    Serial.println("data CUST_CRC_RSLT_LO ");
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::CUST_CRC_RSLT_LO , data_arr_, response);
-
-    Serial.println("    "); */
-
-
-    /* Serial.println("FAULT_SYS Fault");
-    data_arr_[0] = 0x00; 
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::FAULT_SYS, data_arr_, response);
-    Serial.println("    ");
-    Serial.println("FAULT_PWR1 Fault");
-    data_arr_[0] = 0x00; 
-    sendAndReceive(RequestType::SingleRead, 1, 0x01,RegisterAddress::FAULT_PWR1, data_arr_, response); 
-    Serial.println("    ");  */
+    
 }
 bool BQ79600::checkFaultBrigh(){
     Serial.println("");
@@ -929,15 +892,28 @@ bool BQ79600::checkFaultBrigh(){
     }else
         if (response[4] & 0x08){
             Serial.println("FAULT_COMM");
+            Serial.println("=====================");
+            FaultComm1();
+            FaultComm2();
+            Serial.println("=====================");
             return true;
         }else if (response[4] & 0x04){
             Serial.println("FAULT_REG");
+            Serial.println("=====================");
+            Fault_REG();
+            Serial.println("=====================");
             return true;
         }else if (response[4] & 0x02){
             Serial.println("FAULT_SYS");
+            Serial.println("=====================");
+            Fault_SYS();
+            Serial.println("=====================");
             return true;
         }else if(response[4] & 0x01) {
             Serial.println("FAULT_PWR");
+            Serial.println("=====================");
+            Fault_PWR();
+            Serial.println("=====================");
             return true;
         }
         
@@ -946,6 +922,249 @@ bool BQ79600::checkFaultBrigh(){
         return true ;
     
 }
+void BQ79600::FAULT_PROT1(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_PROT1, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_PROT1 No Faults Detected");
+            return ;
+    }else if (response[4] & 0x02){
+            Serial.println("FAULT_PROT1: TPARITY_FAIL");
+    }else if(response[4] & 0x01) {
+            Serial.println("FAULT_PROT1: VPARITY_FAIL");
+        }
+}
+void BQ79600::FAULT_PROT2(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_PROT2, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_PROT2 No Faults Detected");
+            
+    }else if (response[4] & 0x40){
+            Serial.println("FAULT_PROT2: BIST_ABORT");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_PROT2: TPATH_FAIL");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_PROT2: VPATH_FAIL");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_PROT2: UTCOMP_FAIL");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_PROT2: OTCOMP_FAIL");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_PROT2: OVCOMP_FAIL");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_PROT2: UVCOMP_FAIL");
+        }
+}
+
+void BQ79600::FAULT_OV1(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_OV1, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_OV1 No Faults Detected");
+            return ;
+    }else if (response[4] & 0x80){
+            Serial.println("FAULT_OV cell 16");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_OV cell 15");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_OV cell 14");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_OV cell 13");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_OV cell 12");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_OV cell 11");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_OV cell 10");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_OV cell 9");
+        }
+}
+void BQ79600::FAULT_OV2(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_OV2, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_OV2 No Faults Detected");
+            return ;
+    }else
+        if (response[4] & 0x80){
+            Serial.println("FAULT_OV cell 8");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_OV cell 7");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_OV cell 6");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_OV cell 5");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_OV cell 4");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_OV cell 3");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_OV cell 2");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_OV cell 1");
+        }
+}
+void BQ79600::FAULT_UV1(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_UV1, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_UV1 No Faults Detected");
+            return ;
+    }else
+        if (response[4] & 0x80){
+            Serial.println("FAULT_UV cell 16");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_UV cell 15");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_UV cell 14");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_UV cell 13");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_UV cell 12");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_UV cell 11");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_UV cell 10");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_UV cell 9");
+        }
+}
+void BQ79600::FAULT_UV2(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, 0x01 ,RegisterAddress::FAULT_UV2, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_UV2 No Faults Detected");
+            
+        }else if (response[4] & 0x80){
+            Serial.println("FAULT_UV cell 8");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_UV cell 7");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_UV cell 6");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_UV cell 5");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_UV cell 4");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_UV cell 3");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_UV cell 2");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_UV cell 1");
+        }
+}
+/* Fault Brigh*/
+void BQ79600::FaultComm1(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR ,RegisterAddress::FAULTM_COMM1, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FaultComm1: No Faults Detected");
+            return ;
+    }else
+        if (response[4] & 0x80){
+            Serial.println("FAULT_COMM1: RSVD");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_COMM1: FCOMM_DET");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_COMM1: FTONE_DET");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_COMM1: HB_FAST");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_COMM1: HB_FAST");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_COMM1: UART_FRAME");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_COMM1: COMMCLR_DET");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_COMM1: STOP_DET");
+        }
+}
+void BQ79600::FaultComm2(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR ,RegisterAddress::FAULTM_COMM2, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FaultComm2: No Faults Detected");
+            return ;
+    }else
+        if (response[4] & 0x80){
+            Serial.println("FAULT_COMM2: RSVD");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_COMM2: RSVD");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_COMM2: SPI_FRAME");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_COMM2: SPI_PHY");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_COMM2: COML_FRAME");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_COMM2: COML_PHY");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_COMM2: COMH_FRAME");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_COMM2: COMH_PHY");
+        }
+}
+void BQ79600::Fault_REG(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR ,RegisterAddress::FAULTM_REG, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_REG No Faults Detected");
+            
+    }else if (response[4] & 0x04){
+            Serial.println("FAULT_CONF_MON_ERR");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_FACTLDERR");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_FACT_CRC");
+        }
+
+}
+void BQ79600::Fault_SYS(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR ,RegisterAddress::FAULTM_SYS, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_SYS No Faults Detected");
+
+        }else if (response[4] & 0x80){
+            Serial.println("FAULT_VALIDATE_DET");
+        }else if (response[4] & 0x40){
+            Serial.println("FAULT_LFO");
+        }else if (response[4] & 0x20){
+            Serial.println("FAULT_SHUTDOWN_REC");
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_DRST");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_CTL");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_CTS");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_TSHUT");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_INH");
+        }
+}
+void BQ79600::Fault_PWR(){
+    data_arr_[0] = 0x00; 
+    sendAndReceive(RequestType::SingleRead, 1, DEV_ADDR ,RegisterAddress::FAULTM_PWR, data_arr_, response);
+    if(response[4] == 0){
+            Serial.println("FAULT_PWR No Faults Detected");
+
+        }else if (response[4] & 0x10){
+            Serial.println("FAULT_CVDD_UV_DRST");
+        }else if (response[4] & 0x08){
+            Serial.println("FAULT_CVDD_OV");
+        }else if (response[4] & 0x04){
+            Serial.println("FAULT_DVDD_OV");
+        }else if (response[4] & 0x02){
+            Serial.println("FAULT_AVDDREF_OV");
+        }else if(response[4] & 0x01) {
+            Serial.println("FAULT_AVAO_SW_FAIL");
+        }
+}
+
+
 void BQ79600::clearFault() {
 
     // -------------- Clear all faults of Bq79612 -------------------- //

@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include "CRC16.h"
 #include <vector>
+#include <deque>
 #define  DEV_ADDR   0x00   // Device Address  
 
 
@@ -11,7 +12,7 @@ struct BQ79600config {
     uint16_t num_cells_series  ;
     uint16_t num_thermistors ;
     uint16_t num_segments ;
-    float shunt_resistance ;
+    float r_shunt;  // in ohms
 
 };
 struct CellData {
@@ -21,8 +22,9 @@ struct CellData {
 
 struct StackData {
     std::vector<CellData> cells;  // เก็บ volt + gpioTemp ของแต่ละ cell
-    double dieTemp;               // เก็บ dieTemp ของ stack นี้
-    std::vector<double> gpioTemps;           
+    std::vector<double> gpioTemps; 
+    double dieTemp;               //  dieTemp of stack 
+    double busbarVolt;            //  busbarVolt of stack           
 };
 
 class BQ79600 {
@@ -34,14 +36,14 @@ public:
     std::vector<StackData> batteryData_pack;
     
     BQ79600(HardwareSerial &serial, uint32_t baud = 1000000, int tx_pin = 17, BQ79600config config = BQ79600config{});    // constructor
-    void initialize();
+    bool initialize();
     void wakeUp();
     void beginUart();
-    void AutoAddressing();
+    bool AutoAddressing();
     bool ReadMainADC();
     bool ReadAuxADC();
     void cheakstatus();
-    void ReadVoltCellandTemp();
+    void get_data();
     void cheakstatus1();
     void offcommand();
     void Test();
@@ -50,7 +52,7 @@ public:
     bool SetManualAddress(uint8_t manualAddr, unsigned long timeout_ms) ;
     void ReadTemp();
     void BalanceCells(uint8_t mode, size_t stack, const std::vector<size_t>& targetCells, size_t preservedCell, uint8_t hexThreshold);
-    bool cheakBalance ();
+    int cheakBalance ();
     bool checkFaultBase();
     bool checkFaultBrigh();
     void clearFault();
@@ -66,6 +68,13 @@ private:
     std::vector<uint8_t> data_arr_;
     std::vector<uint8_t> response;  
     std::vector<uint8_t> resp_data;  
+    
+    std::vector<std::vector<std::deque<float>>> voltageBuffer;    // [stack][cell]
+    std::vector<std::deque<float>> dieTempBuffer;                 // [stack]
+    std::vector<std::deque<float>> busbarBuffer;                  // [stack]
+    std::vector<std::vector<std::deque<float>>> gpioTempBuffer;   // [stack][thermistor]
+    size_t averageWindow = 1; // ขนาดของ window สำหรับ rolling average
+    
     enum class RegisterAddress : uint16_t 
     { 
         /// BQ79612 Register Addresses//
@@ -135,6 +144,15 @@ private:
         CUST_CRC_RSLT_LO = 0x050C,
         TSREF_HI = 0x058C, // TSREF High
         TSREF_LO = 0x058D, // TSREF Low
+        FAULT_OV1 = 0x053C,
+        FAULT_OV2 = 0x053D,
+        FAULT_UV1 = 0x053E,
+        FAULT_UV2 = 0x053F,
+        FAULT_PROT1      = 0x053A,
+        FAULT_PROT2      = 0x053B,
+        BUSBAR_HI   = 0x0588,
+        BUSBAR_LO   = 0x0589,
+
 
         /// BQ79600 Register Addresses//
         DIR0_ADDR        =   0x0306,    // Device Address North Direction
@@ -153,13 +171,14 @@ private:
         FAULT_RST        =   0x2030,   // Fault Reset
         FAULTM_SUMMARY    =   0x2100,   // Fault Summary master
         FAULTM_REG        =   0x2101,   // Register Faul
-        FAULTM_REG2       =   0x2102,   // System Fault 
+        FAULTM_SYS       =   0x2102,   // System Fault 
         FAULTM_PWR        =   0x2103,   // Power Fault
         FAULTM_COMM1      =   0x2104,   // Communication Fault 1 
-        //FAULT_COMM2      =   0x2105,   // Communication Fault 2
+        FAULTM_COMM2      =   0x2105,   // Communication Fault 2
         DEV_DIAG_STAT    =   0x2110,   // Diagnostic Status
         DEBUG_COMM_STAT  =  0x2300,
         DEBUG_COMM_CTRL  =  0x2201,   // Debug Communication Control
+        
     
     };
     
@@ -185,6 +204,7 @@ private:
     double convertTo_VoltGPIO(uint16_t rawValue) ;
     double convertTo_dietemp(uint16_t rawValue) ;
     double convertTo_TREFVolt(uint16_t rawValue) ;
+    double convertTo_BUSBARVolt(uint16_t rawValue) ;
     bool receiveResponse(std::vector<byte>& response, size_t expected_size, unsigned long timeout_ms);
     bool validateCRC(const std::vector<byte>& frame) ;
     bool sendAndReceive(RequestType req_type, byte data_size, byte dev_addr,RegisterAddress reg_addr, std::vector<byte>& data, std::vector<byte>& response);
@@ -195,15 +215,27 @@ private:
     void config_OT_UT();
     void config_Fault();
     void getResponse(std::vector<byte>& response);
-    
+    void FaultComm1();
+    void FaultComm2();
+    void FAULT_OV1();
+    void FAULT_OV2();
+    void FAULT_UV1();
+    void FAULT_UV2();
+    void Fault_PWR();
+    void Fault_SYS();
+    void Fault_REG();
+    void FAULT_PROT2();
+    void FAULT_PROT1();
     
     uint8_t calculateCRC(const uint8_t *data, uint8_t length);
     uint8_t calcADC_DLY(uint8_t numDevices );
+    float calcAverage(const std::deque<float>& history);
 
     std::vector<std::vector<double>> parseCellVoltages( const std::vector<byte>& response, uint8_t numStacks, uint8_t numCells);
     std::vector<std::vector<double>> parseTemp( const std::vector<byte>& response,const std::vector<double> TSREF, uint8_t numStacks, uint8_t numNTC);
-    std::vector<std::vector<double>> parsedie_Temp( const std::vector<byte>& response, uint8_t numStacks);
+    std::vector<double> parsedie_Temp( const std::vector<byte>& response, uint8_t numStacks);
     std::vector<double> parseTSREF(const std::vector<byte>& response, uint8_t numStacks);
+    std::vector<double> parseBUSBAR(const std::vector<byte>& response, uint8_t numStacks);
 };
 
 #endif
