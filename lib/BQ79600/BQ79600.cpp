@@ -58,7 +58,7 @@ bool BQ79600::initialize() {
     }else if(!autoAddressed){
         return false; // Auto addressing failed
     }
-    
+    return true;
 }
 
 void BQ79600::beginUart1()
@@ -131,23 +131,15 @@ void BQ79600::sendCommandTo(RequestType req_type, byte data_size, byte dev_addr,
     bq_frame_[5 + data_size + (!StackOrBroad)] = command_crc >> 8;
     
     // Debug output
-    Serial.println("Command: ");
+    /* Serial.println("Command: ");
     for (int i = 0; i < frame_len; i++) {  // ✅ ใช้ frame_len
         Serial.printf("%02X ", bq_frame_[i]);
     }
-    Serial.println();
+    Serial.println(); */
     
-    // Clear RX buffer
-    int cleared = 0;
-    while (uart->available()) {
-        uart->read();
-        cleared++;
-    }
-    if (cleared > 0) {
-        Serial.printf("🧹 Pre-cleared %d old bytes\n", cleared);
-    }
     
-    // 
+    
+    // Send frame
     uart->write(bq_frame_, frame_len);  // ← ใช้ frame_len
     uart->flush();
     
@@ -155,7 +147,7 @@ void BQ79600::sendCommandTo(RequestType req_type, byte data_size, byte dev_addr,
     if (req_type == RequestType::StackRead || req_type == RequestType::StackWrite) {
         uint16_t stackDelay = (5 + 1) * NumSegments;
         delay(stackDelay);
-        Serial.printf("⏱️ Stack delay: %d ms\n", stackDelay);
+        //Serial.printf("⏱️ Stack delay: %d ms\n", stackDelay);
     } else {
         delay(5);
     }
@@ -228,7 +220,7 @@ void BQ79600::config_MainADC(uint8_t numcell,uint8_t numStack) {
     Serial.println("");
     Serial.println(" Set LPF_BB_EN, LPF_VCELL,MAIN_MODE command  ");
     Serial.println("Start ReadMainADC ");
-    data_arr_[0] = 0x0E ; //  LPF_BB_EN, LPF_VCELL ,MAIN_MODE
+    data_arr_[0] = 0x1E ; //  LPF_BB_EN, LPF_VCELL ,MAIN_MODE
     sendCommandTo(RequestType::StackWrite, 1, DEV_ADDR, RegisterAddress::ADC_CTRL1 ,data_arr_);   // START ADC
     delayMicroseconds(3500);    //  wait for ADC to start 
     delayMicroseconds(192*8);   //  wait for ADC finished 
@@ -409,7 +401,7 @@ void BQ79600::config_Fault(){
 void BQ79600::get_data() {
     uint8_t response[256];
     
-    // ✅ Temporary static arrays สำหรับเก็บข้อมูลแต่ละรอบ
+    //  Temporary static arrays สำหรับเก็บข้อมูลแต่ละรอบ
     double voltages[MAX_STACKS][MAX_CELLS_PER_STACK];
     double dieTemps[MAX_STACKS];
     double tsref[MAX_STACKS];
@@ -422,11 +414,11 @@ void BQ79600::get_data() {
     //  Loop เก็บข้อมูลหลายรอบ
     for (int round = 0; round < averageWindow; ++round) {
         
-        Serial.printf("=== Reading Round %d/%d ===\n", round + 1, averageWindow);
+        //Serial.printf("=== Reading Round %d/%d ===\n", round + 1, averageWindow);
         
         // ---------- 1. Read Cell Voltages ----------
-        Serial.println("--------------------------------");
-        Serial.println("Reading Cell Voltages...");
+        /* Serial.println("--------------------------------");
+        Serial.println("Reading Cell Voltages..."); */
         
         reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::VCELL16_HI) + (16 - NumCellsSeries) * 2);
         //data_arr_[0] = 0x11; // Dummy data for read
@@ -439,8 +431,8 @@ void BQ79600::get_data() {
         delayMicroseconds(500);
         
         // ---------- 2. Read TSREF ----------
-        Serial.println("--------------------------------");
-        Serial.println("Reading TSREF...");
+        /* Serial.println("--------------------------------");
+        Serial.println("Reading TSREF..."); */
         
         ok = sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, RegisterAddress::TSREF_HI, data_arr_, response);
         
@@ -451,8 +443,8 @@ void BQ79600::get_data() {
         delayMicroseconds(500);
         
         // ---------- 3. Read BUSBAR (Top Stack Only) ----------
-        Serial.println("--------------------------------");
-        Serial.println("Reading BUSBAR Voltage...");
+        /* Serial.println("--------------------------------");
+        Serial.println("Reading BUSBAR Voltage..."); */
         
         ok = sendAndReceive(RequestType::SingleRead, 2, NumSegments, RegisterAddress::BUSBAR_HI, data_arr_, response);
         
@@ -466,8 +458,8 @@ void BQ79600::get_data() {
         delayMicroseconds(500);
         
         // ---------- 4. Read GPIO Temp ----------
-        Serial.println("--------------------------------");
-        Serial.println("Reading GPIO Temp...");
+        /* Serial.println("--------------------------------");
+        Serial.println("Reading GPIO Temp..."); */
         
         reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::GPIO1_HI));
         ok = sendAndReceive(RequestType::StackRead, NumThermistors * 2, DEV_ADDR, reg, data_arr_, response);
@@ -476,11 +468,11 @@ void BQ79600::get_data() {
             size_t response_size = NumSegments * NumThermistors * 2;
             parseTemp(response, response_size, tsref, gpioTemps, NumSegments, NumThermistors);
         }
-        delayMicroseconds(500);
+        delayMicroseconds(1000);
         
         // ---------- 5. Read Die Temp ----------
-        Serial.println("");
-        Serial.println("Reading Die Temp...");
+        /* Serial.println("");
+        Serial.println("Reading Die Temp..."); */
         
         reg = static_cast<RegisterAddress>(static_cast<uint16_t>(RegisterAddress::DIETEMP1_HI));
         ok = sendAndReceive(RequestType::StackRead, 2, DEV_ADDR, reg, data_arr_, response);
@@ -517,7 +509,7 @@ void BQ79600::get_data() {
     }
     
     //  คำนวณค่าเฉลี่ยและเก็บลง batteryData_pack
-    Serial.println("=== Calculating Averages ===");
+    //Serial.println("=== Calculating Averages ===");
     
     for (uint8_t stack = 0; stack < NumSegments; ++stack) {
         batteryData_pack[stack].numCells = NumCellsSeries;
@@ -526,12 +518,12 @@ void BQ79600::get_data() {
         // Cell Voltages
         for (uint8_t cell = 0; cell < NumCellsSeries; ++cell) {
             batteryData_pack[stack].cells[cell].voltage = getAverageVoltage(stack, cell);
-            Serial.printf("Stack %d Cell %d: %.3f V (avg of %d samples)\n", stack, cell, batteryData_pack[stack].cells[cell].voltage, voltageBufferCount[stack][cell]);
+            //Serial.printf("Stack %d Cell %d: %.3f V (avg of %d samples)\n", stack, cell, batteryData_pack[stack].cells[cell].voltage, voltageBufferCount[stack][cell]);
         }
         
         // Die Temperature
         batteryData_pack[stack].dieTemp = getAverageDieTemp(stack);
-        Serial.printf("Stack %d Die Temp: %.2f °C\n", stack, batteryData_pack[stack].dieTemp);
+        //Serial.printf("Stack %d Die Temp: %.2f °C\n", stack, batteryData_pack[stack].dieTemp);
         
         // Busbar (Top Stack Only)
         if (stack == NumSegments - 1) {
@@ -544,12 +536,12 @@ void BQ79600::get_data() {
         // GPIO Temperatures
         for (uint8_t therm = 0; therm < NumThermistors; ++therm) {
             batteryData_pack[stack].gpioTemps[therm] = getAverageGpioTemp(stack, therm);
-            Serial.printf("Stack %d GPIO %d: %.2f °C\n", stack, therm, batteryData_pack[stack].gpioTemps[therm]);
+            //Serial.printf("Stack %d GPIO %d: %.2f °C\n", stack, therm, batteryData_pack[stack].gpioTemps[therm]);
         }
         
         Serial.println();
     }
-    Serial.println("=== Converting Physical → Logical Order ===");
+    //Serial.println("=== Converting Physical → Logical Order ===");
     
     // Temporary buffer สำหรับเก็บข้อมูล
     StackData tempBuffer[MAX_STACKS];
@@ -567,11 +559,11 @@ void BQ79600::get_data() {
         // คัดลอกข้อมูลจาก tempBuffer → batteryData_pack (logical order)
         memcpy(&batteryData_pack[logicalIdx],&tempBuffer[physicalIdx],sizeof(StackData));
         
-        Serial.printf("Physical Stack %d → Logical Stack %d (Address: %d)\n",physicalIdx, logicalIdx, logicalIdx + 1);
+        //Serial.printf("Physical Stack %d → Logical Stack %d (Address: %d)\n",physicalIdx, logicalIdx, logicalIdx + 1);
     }
     
-    Serial.println("=== Physical → Logical Conversion Complete ===\n");
-    Serial.println("=== get_data() Complete ===\n");
+    //Serial.println("=== Physical → Logical Conversion Complete ===\n");
+    //Serial.println("=== get_data() Complete ===\n");
 }
 
 void BQ79600::parsedie_Temp(const uint8_t response[], size_t response_size,double dieTemps[], uint8_t numStacks) {
@@ -1089,11 +1081,11 @@ bool BQ79600::receiveResponse(uint8_t response[], size_t expected_size, unsigned
                 }
 
                 // success
-                Serial.println(" Received valid response:");
+                /* Serial.println(" Received valid response:");
                 for (size_t i = 0; i < bytesReceived; ++i) {
                     Serial.printf("%02X ", response[i]);
                 }
-                Serial.println();
+                Serial.println(); */
                 
                 return true;
             }
@@ -1111,7 +1103,7 @@ bool BQ79600::receiveResponse(uint8_t response[], size_t expected_size, unsigned
         Serial.println();
     }
     if (bytesReceived < expected_size) {
-        delay(200);
+        delay(2000);
         Serial.printf(" Incomplete data! Got %d/%d bytes\n", bytesReceived, expected_size);
         return false;
     }
@@ -1131,7 +1123,7 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
     const size_t FRAME_SIZE = 4 + data_per_device + 2;
     unsigned long start_time = millis();
     
-    Serial.println(" Receiving data...");
+    //Serial.println(" Receiving data...");
     
     while ((millis() - start_time) < timeout_ms && rawBufferSize < expected_size) {
         if (uart->available()) {
@@ -1139,11 +1131,11 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
         }
     }
     
-    Serial.printf(" Received %d bytes (expected %d)\n\n", rawBufferSize, expected_size);
+    //Serial.printf(" Received %d bytes (expected %d)\n\n", rawBufferSize, expected_size);
     
     // ตรวจสอบขนาดข้อมูล
     if (rawBufferSize < expected_size) {
-        delay(200);
+        delay(2000);
         Serial.printf(" Incomplete data! Got %d/%d bytes\n", rawBufferSize, expected_size);
         return false;
     }
@@ -1166,7 +1158,7 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
     for (size_t dev = 0; dev < device_count; ++dev) {
         size_t frameStart = dev * FRAME_SIZE;
         
-        Serial.printf("--- Device %d (Frame at byte %d-%d) ---\n",dev, frameStart, frameStart + FRAME_SIZE - 1);
+        //Serial.printf("--- Device %d (Frame at byte %d-%d) ---\n",dev, frameStart, frameStart + FRAME_SIZE - 1);
         
         //  Extract frame (ใช้ static array)
         uint8_t frame[64];
@@ -1175,20 +1167,20 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
         }
         
         // แสดง raw frame
-        Serial.print("Raw Frame: ");
+        /* Serial.print("Raw Frame: ");
         for (size_t j = 0; j < FRAME_SIZE; ++j) {
             Serial.printf("%02X ", frame[j]);
         }
-        Serial.println();
+        Serial.println(); */
         
         // Parse header
         byte command = frame[0];
         byte devAddr = frame[1];
         uint16_t regAddr = (frame[2] << 8) | frame[3];
         
-        Serial.printf("  Command: 0x%02X (Response: %s, Data Size: %d)\n",command, (command & 0x80) ? "No" : "Yes",(command & 0x07) + 1);
+        /* Serial.printf("  Command: 0x%02X (Response: %s, Data Size: %d)\n",command, (command & 0x80) ? "No" : "Yes",(command & 0x07) + 1);
         Serial.printf("  Device Address: 0x%02X\n", devAddr);
-        Serial.printf("  Register Address: 0x%04X\n", regAddr);
+        Serial.printf("  Register Address: 0x%04X\n", regAddr); */
         
         //  Validate CRC 
         if (!validateCRC(frame, FRAME_SIZE)) {
@@ -1197,15 +1189,15 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
             continue;
         }
         
-        Serial.println(" CRC check PASSED");
+        //Serial.println(" CRC check PASSED");
         
         // Extract data (ข้าม header 4 bytes, ตัด CRC 2 bytes)
-        Serial.print("  Extracted Data: ");
+        //Serial.print("  Extracted Data: ");
         for (size_t i = 4; i < FRAME_SIZE - 2; ++i) {
             response[responseIndex++] = frame[i];
-            Serial.printf("%02X ", frame[i]);
+            //Serial.printf("%02X ", frame[i]);
         }
-        Serial.println("\n");
+        //Serial.println("\n");
     }
     
     if (!allValid) {
@@ -1213,7 +1205,7 @@ bool BQ79600::receiveStackResponse(uint8_t response[], size_t expected_size,size
         return false;
     }
     
-    Serial.printf(" Successfully extracted %d bytes from %d devices\n\n",responseIndex, device_count);
+    //Serial.printf(" Successfully extracted %d bytes from %d devices\n\n",responseIndex, device_count);
     return true;
 }
 

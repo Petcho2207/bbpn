@@ -1,1080 +1,921 @@
-#include "BQ79600.h"
-#include "BMSConfig.h"
+#include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
-#define MAX_CELLS 16            // maximum number of cells per stack
-#define MAX_STACKS 6            // maximum number of stacks  
-#define Fault_led 21            // fault
-#define Active_led 22           // active
-#define Relay 13                // relay control
-#define Nfault 4                // fault input pin
+#include "BQ79600.h"
+#include "BMSConfig.h"
+#include "shared_data.h"
+#include "rtos_config.h"
 
-// ===================== BMS config ===================================================== //
-
-BQ79600config config ;
-
-float tempMAX ;                               // Maximum temperature limit
-float tempMIN ;                               // Minimum temperature limit
-float Vmaxlimit ;                             // Maximum cell voltage limit
-float Vminlimit ;                             // Minimum cell voltage limit
-float Vmaxlimit_pack ;                        // Maximum pack voltage limit
-float Vminlimit_pack ;                        // Minimum pack voltage limit
-float current_max ;                           // Maximum allowable current
-float VoltDiffBalance ;                       // Threshold for balancing
-
-
-// ==================== BMS State ===================================================== //
-
-enum State
-{
-    Active,
-    Sleep,
-    Balance,
-    Fault
-};
-volatile State currentState = Active;
-
-// ================== Parameters milli ===================================================== //
-//  send balance 
-unsigned long lastcanBalanceTime = 0;
-const unsigned long canBalanceInterval = 100;  // 100 ms
-//  เพิ่มตัวแปรสำหรับ LED blink 
-unsigned long lastBlinkTime = 0;
-const unsigned long blinkInterval = 100;  // 100 ms
-bool ledState = false;
-
-unsigned long startTime;                            // เวลาเริ่มต้น
-const unsigned long detailInterval = 0;             // ms, detail frame frequency ~2.5 Hz
-unsigned long lastDetailTime;
-
-unsigned long lastCANCheck = 0;  // ✅ เพิ่มบรรทัดนี้ (ตอนนี้ไม่มี)
-const unsigned long CAN_CHECK_INTERVAL = 50;  // ✅ เพิ่มบรรทัดนี้
-
-// =================== Parameters CAN ===================================================== //
-
-uint8_t  statusFault = 0x00 ;                       // Fault status though CAN
-
-bool loggingEnabled = true;
-
-const uint16_t CAN_ID_SUMMARY_BASE  = 0x400;        // Summary high priority
-const uint16_t CAN_ID_DETAIL_BASE   = 0x500;        // Detail low priority
-const uint16_t CAN_ID_CONFIG        = 0x700;        // Config messages
-// ================= Parameter Data ===================================================== //
-struct Stack_data {
-    float vmin;
-    float vmax;
-    float Vdiff ;
-    float averageVcell; 
-    float total_voltage;
-    float current;
-    size_t vminCells[MAX_CELLS];     //  array number of cells with vmin
-    uint8_t vminCellsCount;          //  count number of cells with vmin
-    size_t vmaxCells[MAX_CELLS];     //  array number of cells with vmax
-    uint8_t vmaxCellsCount;          //  count number of cells with vmax
-};
-
-Stack_data extremaList[MAX_STACKS];       
-
-// ================= Parameter Balance ===================================================== //
-
-uint8_t Auto = 1; 
-uint8_t Manual = 0; 
-uint8_t currentlyBalancingCellsCount[MAX_STACKS];       // จำนวน cell ที่ balance ในแต่ละ stack
-float Vref[MAX_STACKS];         
-bool ready_balance = true;
-bool balancing_complete = true;
-bool balance_flag[MAX_STACKS]; 
-size_t currentlyBalancingCells[MAX_STACKS][MAX_CELLS];  // [stack][cell_index]
-
-
-// ================= Another Parameter ===================================================== //
-const int MAX_RETRIES = 3;
-const int RETRY_DELAY_MS = 5;
-
-// ====================== Objects config =================================================== //
-
+// ========== Global Objects ==========
 BQ79600 *bms = nullptr;
 HardwareSerial mySerial(1);
-MCP2515 mcp2515(5); // CS pin
-BMSConfigManager configManager ; 
+MCP2515 mcp2515(5);        // CS pin
+BMSConfigManager configManager;
+BQ79600config config;
 
-// ========================== Function  =================================================== //
+// ========== Shared Variables (Protected by Mutex) ==========
+volatile State currentState = Active;
+volatile State wasState = Active;
+Stack_data extremaList[MAX_STACKS];
+uint8_t statusFault = 0x00;
+float Vref[MAX_STACKS];
+bool ready_balance = true;
+bool balancing_complete = true;
+bool balance_flag[MAX_STACKS];
+uint8_t currentlyBalancingCellsCount[MAX_STACKS];
+size_t currentlyBalancingCells[MAX_STACKS][MAX_CELLS];
+
+// Configuration globals
+float tempMAX;
+float tempMIN;
+float Vmaxlimit;
+float Vminlimit;
+float Vmaxlimit_pack;
+float Vminlimit_pack;
+float current_max;
+float VoltDiffBalance;
+
+// ========== FreeRTOS Handles ==========
+// handles for control tasks
+TaskHandle_t xHandle_CAN_Task = NULL;
+TaskHandle_t xHandle_Config_Task = NULL;
+TaskHandle_t xHandle_BMS_Task = NULL;
+TaskHandle_t xHandle_Safety_Task = NULL;
+TaskHandle_t xHandle_Balance_Task = NULL;
+
+// handles for control data between tasks
+QueueHandle_t xQueue_BMS_to_CAN = NULL;
+QueueHandle_t xQueue_CAN_to_Config = NULL;
+
+// handles for mutex data between tasks
+SemaphoreHandle_t xMutex_BMS_Data = NULL;
+SemaphoreHandle_t xMutex_Config = NULL;
+SemaphoreHandle_t xMutex_SPI = NULL;
+SemaphoreHandle_t xMutex_Serial = NULL;
+SemaphoreHandle_t xMutex_BMS_UART = NULL;  //  Protect BMS UART access
+
+// ========== Function Prototypes ==========
 void initializeBMS();
-void handleCANMessages();
-void applyConfigToGlobals();  
-void bms_balancing();
-void sendCAN ();
-void print_data_balance();
-void print_data_active();
-void AnalyzePerStackStats(Stack_data result[],uint8_t numStacks);
-bool status_balancing(); 
+void applyConfigToGlobals();
+void AnalyzePerStackStats(Stack_data result[], uint8_t numStacks);
 bool checkFaults();
 bool checkHardwareFaults();
+void bms_balancing(uint8_t numStacks);
+bool status_balancing(uint8_t numStacks);
 uint8_t voltageToHex(float Vmin);
 
-
-// interrupt hardware fault
+// Interrupt handler
 volatile bool interruptTriggered = false;
 void IRAM_ATTR handleInterrupt() {
-    digitalWrite(Relay, LOW);                           //  Relay close (safety)
-    digitalWrite(Active_led, LOW);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    // Set interrupt flag
     interruptTriggered = true;
-    currentState = Fault;
-    Serial.println("55555555555555555555555555555555555555555555----------!");
+    
+    // Notify Safety Task immediately
+    vTaskNotifyGiveFromISR(xHandle_Safety_Task, &xHigherPriorityTaskWoken);
+    
+    // Yield if higher priority task woken
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
-// ====================================================================================== //
+
+// ========================================================================
+// ========================= CORE 0 TASKS (Communication) =================
+// ========================================================================
+
+// ========== Task 1: CAN Communication (Core 0, Priority 3) ==========
+void Task_CAN(void *pvParameters) {
+    struct can_frame frame;
+    BMS_Data_Packet packet;
+    
+    // Print task start message (with mutex protection)
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+        Serial.println("[CAN] Task started on Core 0");
+        xSemaphoreGive(xMutex_Serial);
+    }
+    
+    // Timing variables
+    TickType_t xLastCANCheck = xTaskGetTickCount();
+    const TickType_t xCANCheckInterval = pdMS_TO_TICKS(50);  // Check every 50 ms
+    
+    while (1) {
+        // ===== CAN RX: Check for incoming messages =====
+        if (xSemaphoreTake(xMutex_SPI, pdMS_TO_TICKS(10)) == pdTRUE) {
+            // Read CAN message (non-blocking)
+            if (mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
+                // Check if config message (ID: 0x700)
+                if (frame.can_id == 0x700) {
+                    // Send to Config Task via queue
+                    xQueueSend(xQueue_CAN_to_Config, &frame, 0);  // Don't block
+                    
+                    // Debug print (with mutex)
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.printf("[CAN] Config command received (ID: 0x%03X)\n", frame.can_id);
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                }
+            }
+            xSemaphoreGive(xMutex_SPI);
+        }
+        
+        // ===== CAN TX: Send BMS data =====
+        // Check if data available in queue (non-blocking)
+        if (xQueueReceive(xQueue_BMS_to_CAN, &packet, 0) == pdTRUE) {
+            // Take SPI mutex for CAN transmission
+            if (xSemaphoreTake(xMutex_SPI, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // Prepare summary frame (high priority)
+                struct can_frame txFrame;
+                txFrame.can_id = 0x400 + (packet.stackIndex << 4);  // Base ID + stack offset
+                txFrame.can_dlc = 8;
+                
+                // Pack data: [totalV(2), current(2), vmin(2), vmax(2)]
+                uint16_t totalV = (uint16_t)(packet.total_voltage * 10.0f);   // 0.1V per LSB
+                int16_t curr = (int16_t)(packet.current * 10.0f);             // 0.1A per LSB
+                uint16_t vmin = (uint16_t)(packet.vmin * 1000.0f);            // mV
+                uint16_t vmax = (uint16_t)(packet.vmax * 1000.0f);            // mV
+                
+                txFrame.data[0] = (totalV >> 8) & 0xFF;  // Total voltage high byte
+                txFrame.data[1] = totalV & 0xFF;         // Total voltage low byte
+                txFrame.data[2] = (curr >> 8) & 0xFF;    // Current high byte (signed)
+                txFrame.data[3] = curr & 0xFF;           // Current low byte
+                txFrame.data[4] = (vmin >> 8) & 0xFF;    // Vmin high byte
+                txFrame.data[5] = vmin & 0xFF;           // Vmin low byte
+                txFrame.data[6] = (vmax >> 8) & 0xFF;    // Vmax high byte
+                txFrame.data[7] = vmax & 0xFF;           // Vmax low byte
+                
+                // Send CAN frame
+                mcp2515.sendMessage(&txFrame);
+                
+                // Release SPI mutex
+                xSemaphoreGive(xMutex_SPI);
+                
+                // Debug print (with mutex)
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.printf("[CAN] Sent data for Stack %d (V: %.1f, I: %.1f)\n",
+                                  packet.stackIndex, packet.total_voltage, packet.current);
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+        }
+        
+        // Delay until next check interval (precise timing)
+        vTaskDelayUntil(&xLastCANCheck, xCANCheckInterval);
+    }
+}
+
+// ========== Task 2: Config Manager (Core 0, Priority 2) ==========
+void Task_Config(void *pvParameters) {
+    struct can_frame frame;
+    
+    // Print task start message
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+        Serial.println("[Config] Task started on Core 0");
+        xSemaphoreGive(xMutex_Serial);
+    }
+    
+    while (1) {
+        // Wait for config command from CAN Task (blocking)
+        if (xQueueReceive(xQueue_CAN_to_Config, &frame, portMAX_DELAY) == pdTRUE) {
+            // Take config mutex
+            if (xSemaphoreTake(xMutex_Config, pdMS_TO_TICKS(200)) == pdTRUE) {
+                // Process CAN command
+                bool ok = configManager.processCANCommand(
+                    frame.can_id,
+                    frame.data,
+                    frame.can_dlc
+                );
+                
+                if (ok) {
+                    // Debug print
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.println("[Config] Config updated successfully");
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                    
+                    // Apply new config to global variables
+                    applyConfigToGlobals();
+                    
+                    // Check if hardware config changed (need BMS re-init)
+                    if (configManager.needsRestart()) {
+                        // Notify BMS Task to re-initialize
+                        xTaskNotifyGive(xHandle_BMS_Task);
+                        
+                        // Debug print
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.println("[Config] Hardware config changed, notifying BMS Task");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                    }
+                } else {
+                    // Debug print error
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.println("[Config] Failed to process command");
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                }
+                
+                // Release config mutex
+                xSemaphoreGive(xMutex_Config);
+            }
+        }
+    }
+}
+
+// ========================================================================
+// ========================= CORE 1 TASKS (BMS Control) ===================
+// ========================================================================
+
+// ========== Task 3: BMS Data Read (Core 1, Priority 5 - Critical) ==========
+void Task_BMS(void *pvParameters) {
+
+    // trigger variables for precise timing
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
+    
+    // Print task start message
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+        Serial.println("[BMS] Task started on Core 1");
+        xSemaphoreGive(xMutex_Serial);
+    }
+    
+    while (1) {
+        // Check for re-initialization request
+        if (ulTaskNotifyTake(pdFALSE, 0) > 0) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) { 
+                Serial.println("[BMS] Re-initializing BMS...");
+                xSemaphoreGive(xMutex_Serial);
+            }
+            
+            if (xSemaphoreTake(xMutex_Config, pdMS_TO_TICKS(200)) == pdTRUE) {
+                initializeBMS();
+                configManager.clearRestartFlag();
+                xSemaphoreGive(xMutex_Config);
+                
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    Serial.println("[BMS] Re-initialization complete");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+        }
+        
+        // Take BMS data mutex
+        if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(100)) == pdTRUE) {
+        
+            // ===== ✅ UART Mutex: SHORT duration (เฉพาะ get_data) =====
+            if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(100)) == pdTRUE) {
+                
+                // Read BMS data (UART communication - ~10ms)
+                unsigned long startTime = millis();
+                bms->get_data();
+                unsigned long duration = millis() - startTime;
+                if (duration > 50) {
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.printf("[BMS] ⚠️ WARNING: bms->get_data() took %lu ms (expected: ~10ms)\n", 
+                                    duration);
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                }
+                // ✅ ปลดล็อก UART ทันที (ไม่รอ AnalyzePerStackStats)
+                xSemaphoreGive(xMutex_BMS_UART);
+                
+            } else {
+                // Timeout: UART locked
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[BMS] Warning: UART mutex timeout");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                xSemaphoreGive(xMutex_BMS_Data);
+                vTaskDelayUntil(&xLastWakeTime, xFrequency);
+                continue;
+            }
+            
+            // ===== ✅ ออกจาก UART Mutex → ทำการวิเคราะห์ (ไม่ล็อก UART) =====
+            // Analyze per-stack statistics (ไม่ต้องล็อก UART!)
+            AnalyzePerStackStats(extremaList, bms->NumSegments);
+            
+            // ✅ Notify Safety Task: ข้อมูล BMS พร้อม (UART ว่างแล้ว)
+            xTaskNotifyGive(xHandle_Safety_Task);
+            
+            // Send data to CAN Task (Core 0)
+            for (uint8_t i = 0; i < bms->NumSegments; i++) {
+                BMS_Data_Packet packet;
+                packet.stackIndex = i;
+                packet.vmax = extremaList[i].vmax;
+                packet.vmin = extremaList[i].vmin;
+                packet.vavg = extremaList[i].averageVcell;
+                packet.total_voltage = extremaList[i].total_voltage;
+                packet.current = extremaList[i].current;
+                packet.temps[0] = bms->batteryData_pack[i].gpioTemps[0];
+                packet.temps[1] = bms->batteryData_pack[i].gpioTemps[1];
+                packet.dieTemp = bms->batteryData_pack[i].dieTemp;
+                packet.statusFault = statusFault;
+                packet.timestamp = millis();
+                
+                xQueueSend(xQueue_BMS_to_CAN, &packet, 0);
+            }
+            
+            // Release BMS data mutex
+            xSemaphoreGive(xMutex_BMS_Data);
+        
+        }
+        
+        // Precise delay until next read cycle
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+// ========== Task 4: Safety Monitor (Core 1, Priority 5 - Critical) ==========
+
+void Task_Safety(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+        Serial.println("[Safety] Task started on Core 1");
+        Serial.println("[Safety] Ready for fault monitoring");
+        xSemaphoreGive(xMutex_Serial);
+    }
+    
+    while (1) {
+        uint32_t notifyValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+        
+        // ===== Check Hardware Interrupt (immediate) =====
+        if (interruptTriggered) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.println("[Safety] Hardware interrupt detected!");
+                xSemaphoreGive(xMutex_Serial);
+            }
+            
+            // ✅ บันทึก State ก่อน Fault
+            wasState = currentState;
+            
+            // Immediate safety action
+            digitalWrite(Relay, LOW);
+            digitalWrite(Active_led, LOW);
+            digitalWrite(Fault_led, HIGH);
+            currentState = Fault;
+            interruptTriggered = false;
+            
+            if (xHandle_Balance_Task != NULL) {
+                vTaskSuspend(xHandle_Balance_Task);
+            }
+        }
+        
+        // ===== Check based on current state =====
+        if (currentState == Fault) {
+            if (xHandle_Balance_Task != NULL) {
+                vTaskSuspend(xHandle_Balance_Task);
+            }
+
+            if (notifyValue > 0) {
+                if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    bool softwareFault = checkFaults();
+                    bool hardwareFault = false;
+
+                    hardwareFault = checkHardwareFaults();
+                        
+                    
+                    xSemaphoreGive(xMutex_BMS_Data);
+                    
+                    // ✅ ถ้า Fault หาย → กลับไป State เดิม (wasState)
+                    if (!softwareFault && !hardwareFault) {
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.printf("[Safety] Fault cleared! Returning to %s state\n",
+                                          wasState == Balance ? "Balance" : "Active");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                        
+                        // Clear fault in BQ79600
+                        if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            bms->clearFault();
+                            xSemaphoreGive(xMutex_BMS_UART);
+                        }
+                        
+                        // Recovery actions
+                        digitalWrite(Relay, HIGH);
+                        digitalWrite(Active_led, HIGH);
+                        digitalWrite(Fault_led, LOW);
+                        
+                        // ✅ กลับไป State เดิม (wasState)
+                        currentState = wasState;
+                        statusFault = 0x00;
+                        
+                        // Resume Balancing Task
+                        if (xHandle_Balance_Task != NULL) {
+                            vTaskResume(xHandle_Balance_Task);
+                        }
+                    } else {
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.println("[Safety] Fault still present");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                    }
+                }
+            }
+        } else {
+            if (notifyValue > 0) {
+                if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    
+                    bool softwareFault = checkFaults();
+                    bool hardwareFault = false;
+                    hardwareFault = checkHardwareFaults();
+                    
+                    
+                    // ===== เช็คว่าต้อง Balance หรือไม่ =====
+                    if (!softwareFault && !hardwareFault && currentState == Active) {
+                        bool needBalance = false;
+                        for (uint8_t i = 0; i < bms->NumSegments; i++) {
+                            if (extremaList[i].Vdiff > VoltDiffBalance) {
+                                balance_flag[i] = true;
+                                needBalance = true;
+                                Vref[i] = extremaList[i].vmin;
+                                
+                                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                                    Serial.printf("[Safety] Stack %d needs balancing (Vdiff: %.3f V > %.3f V)\n",
+                                                  i, extremaList[i].Vdiff, VoltDiffBalance);
+                                    Serial.printf("[Safety] Vref: %.3f V (Vmin: %.3f V)\n",
+                                                  Vref[i], extremaList[i].vmin);
+                                    xSemaphoreGive(xMutex_Serial);
+                                }
+                            } else {
+                                balance_flag[i] = false;
+                            }
+                        }
+                        
+                        if (needBalance) {
+                            if (!ready_balance) {
+
+                                currentState = Balance;
+                                ready_balance = true;
+                            
+                                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                                    Serial.println("[Safety] Entering Balance state");
+                                    xSemaphoreGive(xMutex_Serial);
+                                }
+                            } else {// ready_balance ยัง = true (คำสั่งเก่ายังไม่ถูกประมวลผล)
+                                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                                    Serial.println("[Safety] Balance command already pending, waiting...");
+                                    xSemaphoreGive(xMutex_Serial);
+                                }
+                            }
+                        }else{
+                            if (ready_balance) {
+                                ready_balance = false;
+                                
+                                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                                    Serial.println("[Safety] Vdiff normal, clearing balance request");
+                                    xSemaphoreGive(xMutex_Serial);
+                                }
+                            }
+                        }
+                    }
+                    
+                    xSemaphoreGive(xMutex_BMS_Data);
+                    
+                    // ===== Safety Action (if any fault detected) =====
+                    if (softwareFault || hardwareFault) {
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.println("[Safety] Fault detected! Entering Fault state");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                        
+                        // ✅ บันทึก State ก่อน Fault
+                        wasState = currentState;
+                        
+                        // Safety action
+                        digitalWrite(Relay, LOW);
+                        digitalWrite(Active_led, LOW);
+                        digitalWrite(Fault_led, HIGH);
+                        currentState = Fault;
+                        
+                        if (xHandle_Balance_Task != NULL) {
+                            vTaskSuspend(xHandle_Balance_Task);
+                        }
+                    }
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } 
+}
+
+// ========== Task 5: Cell Balancing (Core 1, Priority 4) ==========
+// แทนที่ฟังก์ชัน Task_Balance ทั้งหมด (บรรทัด 477-649)
+void Task_Balance(void *pvParameters) {
+    TickType_t xLastBalanceCheck = xTaskGetTickCount();
+    const TickType_t xBalanceInterval = pdMS_TO_TICKS(500);
+    
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(100)) == pdTRUE) {
+        Serial.println("[Balance] Task started on Core 1");
+        xSemaphoreGive(xMutex_Serial);
+    }
+    
+    // ตัวแปรเก็บสถานะ
+    bool isBalancing = false;
+    bool wasBalancing = false;
+    
+    while (1) {
+        // รอจนกว่า state จะเป็น Balance
+        while (currentState != Balance) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // ✅ เช็คอีกครั้งหลัง delay (ป้องกัน race condition)
+        if (currentState != Balance) {
+            vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+            continue;
+        }
+        
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Balance] Entering Balance state");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        // Blink LED
+        digitalWrite(Active_led, !digitalRead(Active_led));
+        
+        // อ่าน NumSegments
+        uint8_t numStacks = 0;
+        if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(50)) == pdTRUE) {
+            numStacks = bms->NumSegments;
+            xSemaphoreGive(xMutex_BMS_Data);
+        }
+        
+        // ✅ เช็คก่อนดำเนินการต่อ
+        if (currentState != Balance) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.println("[Balance] State changed after reading NumSegments, aborting");
+                xSemaphoreGive(xMutex_Serial);
+            }
+            vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+            continue;
+        }
+        
+        // ===== ขั้นตอนที่ 1: เช็คว่า IC กำลัง Balance อยู่หรือไม่ (Resume after Fault) =====
+        if (wasBalancing && !isBalancing) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.println("[Balance] Checking if IC is still balancing (after fault)...");
+                xSemaphoreGive(xMutex_Serial);
+            }
+            
+            bool icStillBalancing = false;
+            
+            if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(100)) == pdTRUE) {
+                for (uint8_t stackIndex = 0; stackIndex < numStacks; stackIndex++) {
+                    if (!balance_flag[stackIndex]) continue;
+                    
+                    uint8_t addressBQ = stackIndex + 1;
+                    int status = bms->checkBalance(addressBQ);
+                    
+                    if (status != 0x00 && status != 0x01) {
+                        icStillBalancing = true;
+                        
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.printf("[Balance] IC Stack %d still balancing (status: 0x%02X)\n", 
+                                          stackIndex, status);
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                    }
+                }
+                
+                xSemaphoreGive(xMutex_BMS_UART);
+            }
+            
+            // ✅ เช็คหลังปลดล็อก UART
+            if (currentState != Balance) {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] State changed during IC status check, aborting");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+                continue;
+            }
+            
+            if (icStillBalancing) {
+                isBalancing = true;
+                
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] IC resumed balancing after fault, waiting...");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            } else {
+                wasBalancing = false;
+                
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] IC completed balancing during fault");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+        }
+        
+        // ===== ขั้นตอนที่ 2: ถ้ากำลัง Balance → เช็คสถานะ =====
+        if (isBalancing) {
+            bool isComplete = false;
+            
+            if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(100)) == pdTRUE) {
+                isComplete = status_balancing(numStacks);
+                xSemaphoreGive(xMutex_BMS_UART);
+            } else {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] Warning: UART mutex timeout (status check)");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+            
+            // ✅ เช็คหลังปลดล็อก UART
+            if (currentState != Balance) {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] State changed during status check, aborting");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+                continue;
+            }
+            
+            // ===== ถ้า Balance เสร็จ → กลับ Active =====
+            if (isComplete) {
+                if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.println("[Balance] Balancing completed, returning to Active");
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                    
+                    // Clear flags
+                    for (size_t i = 0; i < bms->NumSegments; i++) {
+                        balance_flag[i] = false;
+                    }
+                    
+                    ready_balance = false;
+                    isBalancing = false;
+                    wasBalancing = false;
+                    currentState = Active;
+                    
+                    xSemaphoreGive(xMutex_BMS_Data);
+                }
+            } else {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] Balancing in progress...");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+        } 
+        // ===== ขั้นตอนที่ 3: ถ้ายังไม่มีการ Balance → เช็คว่าต้องสั่งหรือไม่ =====
+        else {
+            bool shouldBalance = false;
+            
+            if (xSemaphoreTake(xMutex_BMS_Data, pdMS_TO_TICKS(100)) == pdTRUE) {
+                shouldBalance = ready_balance;
+                if (shouldBalance) {
+                    ready_balance = false;
+                }
+                xSemaphoreGive(xMutex_BMS_Data);
+            }
+            
+            // ✅ เช็คก่อนสั่ง Balance
+            if (currentState != Balance) {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] State changed before sending command, aborting");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+                continue;
+            }
+            
+            if (shouldBalance) {
+                if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    // ✅ เช็คอีกครั้งภายใน UART Mutex (critical section)
+                    if (currentState == Balance) {
+                        bms_balancing(numStacks);
+                        isBalancing = true;
+                        wasBalancing = true;
+                        
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.println("[Balance] Balancing command sent");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                    } else {
+                        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            Serial.println("[Balance] State changed during UART lock, aborting");
+                            xSemaphoreGive(xMutex_Serial);
+                        }
+                    }
+                    
+                    xSemaphoreGive(xMutex_BMS_UART);
+                } else {
+                    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        Serial.println("[Balance] Warning: UART mutex timeout (balancing)");
+                        xSemaphoreGive(xMutex_Serial);
+                    }
+                }
+            } else {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.println("[Balance] Warning: In Balance state but no command");
+                    xSemaphoreGive(xMutex_Serial);
+                }
+            }
+        }
+        
+        vTaskDelayUntil(&xLastBalanceCheck, xBalanceInterval);
+    }
+}
+
+// ========================================================================
+// ============================= SETUP ====================================
+// ========================================================================
 
 void setup() {
-
+    // Initialize serial (blocking until ready)
     Serial.begin(115200);
     while (!Serial);
-    pinMode(Fault_led, OUTPUT);                         // status output config (fault led)
-    pinMode(Active_led, OUTPUT);                        // status output config (active led)
-    pinMode(Relay,OUTPUT);                              // relay output config
-    pinMode(Nfault,INPUT);                              // nfault input config
-
-    digitalWrite(Relay, LOW);
-    digitalWrite(Fault_led, LOW);
-    digitalWrite(Active_led, LOW);
-
+    
+    Serial.println("\n========================================");
+    Serial.println("BMS Dual-Core FreeRTOS System Starting");
+    Serial.println("========================================\n");
+    
+    // Configure GPIO pins
+    pinMode(Fault_led, OUTPUT);
+    pinMode(Active_led, OUTPUT);
+    pinMode(Relay, OUTPUT);
+    pinMode(Nfault, INPUT_PULLUP);
+    
+    // Initial GPIO states (safe defaults)
+    digitalWrite(Relay, LOW);       // Relay off (safety)
+    digitalWrite(Fault_led, LOW);   // Fault LED off
+    digitalWrite(Active_led, LOW);  // Active LED off
+    
+    // Initialize MCP2515 CAN controller
+    Serial.println("[Init] Configuring MCP2515...");
     mcp2515.reset();
     mcp2515.setBitrate(CAN_250KBPS, MCP_8MHZ);
     mcp2515.setNormalMode();
+    Serial.println("[Init] MCP2515 ready");
     
-    mySerial.begin(1000000, SERIAL_8N1, 16, 17);        // BQ79600 Serial config
-
+    // Initialize BQ79600 UART
+    Serial.println("[Init] Configuring BQ79600 UART...");
+    mySerial.begin(1000000, SERIAL_8N1, 16, 17);  // 1 Mbps, RX=16, TX=17
+    Serial.println("[Init] UART ready");
+    
+    // Initialize config manager
+    Serial.println("[Init] Loading configuration from NVS...");
     bool config_ok = configManager.initialize();
-    
     if (!config_ok) {
-        Serial.println("⚠️ Config initialization failed, using defaults");
+        Serial.println("[Init] Config load failed, using defaults");
+    } else {
+        Serial.println("[Init] Config loaded successfully");
     }
-    // Apply config
+    
+    // Apply config to global variables
     applyConfigToGlobals();
+    
+    // Initialize BMS object
     initializeBMS();
     
+    // Attach hardware interrupt (Nfault pin)
+    Serial.println("[Init] Attaching hardware interrupt...");
     attachInterrupt(digitalPinToInterrupt(Nfault), handleInterrupt, FALLING);
+    Serial.println("[Init] Interrupt attached");
+    
+    // ========== Create FreeRTOS Resources ==========
+    Serial.println("\n[RTOS] Creating mutexes...");
+    xMutex_BMS_Data = xSemaphoreCreateMutex();
+    xMutex_Config = xSemaphoreCreateMutex();
+    xMutex_SPI = xSemaphoreCreateMutex();
+    xMutex_Serial = xSemaphoreCreateMutex();
+    xMutex_BMS_UART = xSemaphoreCreateMutex();
+    Serial.println("[RTOS] Mutexes created");
+    
+    Serial.println("[RTOS] Creating queues...");
+    xQueue_BMS_to_CAN = xQueueCreate(10, sizeof(BMS_Data_Packet));     // 10 packets buffer FIFO
+    xQueue_CAN_to_Config = xQueueCreate(5, sizeof(struct can_frame));  // 5 frames buffer FIFO
+    Serial.println("[RTOS] Queues created");
+    
+    // ========== Create Tasks (Core 0: Communication) ==========
+    Serial.println("\n[RTOS] Creating Core 0 tasks (Communication)...");
+    
+    xTaskCreatePinnedToCore(
+        Task_CAN,                    // Task function
+        "CAN_Task",                  // Task name
+        4096,                        // Stack size (bytes)
+        NULL,                        // Parameters
+        3,                           // Priority (0-5, higher = more important)
+        &xHandle_CAN_Task,           // Task handle
+        0                            // Core 0
+    );
+    Serial.println("[RTOS]   - CAN_Task created (Core 0, Priority 3)");
+    
+    xTaskCreatePinnedToCore(
+        Task_Config,
+        "Config_Task",
+        4096,
+        NULL,
+        2,
+        &xHandle_Config_Task,
+        0                            // Core 0
+    );
+    Serial.println("[RTOS]   - Config_Task created (Core 0, Priority 2)");
+    
+    // ========== Create Tasks (Core 1: BMS Control) ==========
+    Serial.println("\n[RTOS] Creating Core 1 tasks (BMS Control)...");
+    
+    xTaskCreatePinnedToCore(
+        Task_BMS,
+        "BMS_Task",
+        8192,                        // Larger stack (BQ79600 has lots of data)
+        NULL,
+        5,                           // Critical priority
+        &xHandle_BMS_Task,
+        1                            // Core 1
+    );
+    Serial.println("[RTOS]   - BMS_Task created (Core 1, Priority 5)");
+    
+    xTaskCreatePinnedToCore(
+        Task_Safety,
+        "Safety_Task",
+        4096,
+        NULL,
+        5,                           // Critical priority
+        &xHandle_Safety_Task,
+        1                            // Core 1
+    );
+    Serial.println("[RTOS]   - Safety_Task created (Core 1, Priority 5)");
+    
+    xTaskCreatePinnedToCore(
+        Task_Balance,
+        "Balance_Task",
+        4096,
+        NULL,
+        4,
+        &xHandle_Balance_Task,
+        1                            // Core 1
+    );
+    Serial.println("[RTOS]   - Balance_Task created (Core 1, Priority 4)");
+    
+    Serial.println("\n========================================");
+    Serial.println("System Initialization Complete");
+    Serial.println("FreeRTOS Scheduler Starting...");
+    Serial.println("========================================\n");
+    
+    // Enable relay (system ready)
     digitalWrite(Relay, HIGH);
-    
+    digitalWrite(Active_led, HIGH);
 }
+
 void loop() {
-    
-    delayMicroseconds(500);
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastCANCheck >= CAN_CHECK_INTERVAL) {
-        handleCANMessages();
-        lastCANCheck = currentMillis;
-    }
-    
-    // ✅ 2. Check Hardware Config Change (need re-init)
-    if (configManager.needsRestart()) {
-        Serial.println("\n🔄 Hardware config changed! Re-initializing BMS...");
-        
-        applyConfigToGlobals();  // ✅ Update config struct
-        initializeBMS();         // ✅ Re-create BMS object
-        configManager.clearRestartFlag();
-        
-        Serial.println("✅ BMS re-initialized\n");
-    }
-
-    switch (currentState){
-
-        case Active :{
-            
-            digitalWrite(Active_led, HIGH);
-            bms->get_data();
-            AnalyzePerStackStats(extremaList, bms->NumSegments);
-            //sendCAN ();
-            print_data_active(); 
-            ///------------------ fault software check ------------------/// 
-            if (checkFaults()) {
-                currentState = Fault;
-                digitalWrite(Relay, LOW);  // ปิด Relay ทันที (ปลอดภัย)
-                digitalWrite(Active_led, LOW);
-                Serial.println("6666666666666666666666666----------!");
-                break;  // ← ออกจาก case Active ทันที
-            }
-            //------------------ find Vmin each stack ------------------//
-            if(balancing_complete == true){
-                // เก็บ Vref สำหรับแต่ละ stack
-                for (size_t i = 0; i < bms->NumSegments; ++i) {
-                    Vref[i] = extremaList[i].vmin;
-                    Serial.printf("Stack %d: Vref = %.3f V (from vmin)\n", i, Vref[i]);
-                }
-                balancing_complete = false;
-                Serial.println("=====================================\n");
-            }
-
-            //------------------ Check each stack for balancing need  ------------------//    
-            for (size_t i = 0; i < bms->NumSegments; ++i) {
-            
-                extremaList[i].Vdiff = extremaList[i].vmax - extremaList[i].vmin;
-                Serial.printf("Stack %d Voltage Diff: %.3f V\n", (int)i, extremaList[i].Vdiff);
-                float Vconddiff = extremaList[i].vmax - Vref[i]; // conditioned balance each stack for set flag
-                if (Vconddiff > VoltDiffBalance) {
-                        balance_flag[i] = true;
-                        ready_balance = true;
-                }else{
-                        balance_flag[i] = false;
-                }
-            }
-            //------------------ Check each stack for change state ------------------//
-            if(ready_balance){
-                currentState = Balance ;
-            }else{
-                Serial.printf("No balancing required for else stack");
-                if (balancing_complete == false){
-                    startTime = millis(); // บันทึกเวลาเริ่มต้น
-                    balancing_complete = true;
-                }
-            }
-            if (balancing_complete){
-                unsigned long currentMillis = millis();
-                if (currentMillis - startTime >= 60000*5) { // 5 นาที
-                        
-                    Serial.println("Go to Sleep mode");
-                    currentState = Sleep;  
-                    break;  // ออกจาก loop
-                        
-                }
-            } 
-            
-            
-            break;
-        }
-        
-
-        case Balance :{
-            unsigned long currentMillis = millis();
-            if (currentMillis - lastBlinkTime >= blinkInterval) {
-                lastBlinkTime = currentMillis;
-                ledState = !ledState;
-                digitalWrite(Active_led, ledState ? HIGH : LOW);
-            }
-
-            if (currentMillis - lastcanBalanceTime >= canBalanceInterval) {
-                lastcanBalanceTime = currentMillis;
-                for (size_t i = 0; i < bms->NumSegments ; ++i) {  
-                    if (balance_flag[i]) {
-                        bms->pauseBalanceCells(i);
-                    }
-                }
-                //sendCAN ();
-                for (size_t i = 0; i < bms->NumSegments ; ++i) {  
-                    if (balance_flag[i]) {
-                        bms->unpauseBalanceCells(i);
-                    }
-                }
-            }
-
-            if (ready_balance) {
-                ready_balance = false;
-                bms_balancing();
-            }
-
-            bms->get_data();
-            AnalyzePerStackStats(extremaList, bms->NumSegments);
-            //sendCAN ();
-            //print_data_balance();
-            if (status_balancing()) {
-                for (size_t i = 0; i < bms->NumSegments ; ++i) {  
-                    balance_flag[i] = false;
-                }
-                digitalWrite(Active_led, LOW);
-                ledState = false;
-                currentState = Active ;
-            }
-
-            
-            break;
-        }    
-            
-
-        case Fault: {
-            Serial.println("\n===  Entering Fault State ===");
-            Serial.println(" Relay: OFF (SAFETY MODE)");
-            Serial.println("Waiting for all faults to clear...\n");
-            unsigned long faultStateEntryTime = micros();  // เวลาเข้าสู่สถานะ Fault
-            digitalWrite(Fault_led, HIGH);
-            
-            const unsigned long FAULT_CHECK_INTERVAL = 5 ;  // เช็คทุก  5 ms
-            const unsigned long FAULT_CLEAR_DURATION = 1000;  // ต้องปกติต่อเนื่อง 1 วินาที
-    
-            unsigned long faultClearTime = 0;
-            bool faultCleared = false;
-    
-            while (true) {  
-                
-                digitalWrite(Fault_led, HIGH);
-                
-                unsigned long currentMillis = millis();
-                uint8_t newStatusFault = 0x00;
-                bool anyFault = false;
-
-                //  เช็ค Interrupt Flag (ถ้ามี interrupt เกิดขึ้นระหว่าง loop)
-                if (interruptTriggered) {
-                    Serial.println(" Interrupt triggered during fault check!");
-                    interruptTriggered = false;
-                }
-                // เช็ค Hardware Fault จาก IC ก่อน
-                bool hardwareFaultDetected = checkHardwareFaults();
-                // เคลียร์ statusFault ก่อนเช็คใหม่
-
-                if (hardwareFaultDetected) {
-                    Serial.println(" Hardware fault detected! Clearing...");
-                    bms->clearFault();  // พยายามเคลียร์ fault
-                    faultCleared = false;
-                    bms->get_data();
-                    AnalyzePerStackStats(extremaList, bms->NumSegments);
-                    //print_data_active();
-                    continue;  // ข้ามไปรอบถัดไป
-                }     
-
-                // === เช็คทุก Stack === //
-                for (size_t i = 0; i < bms->NumSegments; ++i) {
-            
-                    // 1. Pack Overvoltage (bit 4)
-                    if (extremaList[i].total_voltage > Vmaxlimit_pack) {
-                        newStatusFault |= 0x10;
-                        anyFault = true;
-                        Serial.printf(" Stack %d: Pack OV (%.1f V > %.1f V)\n", i, extremaList[i].total_voltage, Vmaxlimit_pack);
-                    }
-            
-                    // 2. Pack Undervoltage (bit 5)
-                    if (extremaList[i].total_voltage < Vminlimit_pack) {
-                        newStatusFault |= 0x20;
-                        anyFault = true;
-                        Serial.printf(" Stack %d: Pack UV (%.1f V < %.1f V)\n", i, extremaList[i].total_voltage, Vminlimit_pack);
-                    }
-            
-                    // 3. Cell Overvoltage (bit 0)
-                    if (extremaList[i].vmax >= Vmaxlimit) {
-                        newStatusFault |= 0x01;
-                        anyFault = true;
-                        Serial.printf(" Stack %d: Cell OV (%.3f V >= %.1f V)\n", i, extremaList[i].vmax, Vmaxlimit);
-                    }
-            
-                    // 4. Cell Undervoltage (bit 1)
-                    if (extremaList[i].vmin <= Vminlimit) {
-                        newStatusFault |= 0x02;
-                        anyFault = true;
-                        Serial.printf(" Stack %d: Cell UV (%.3f V <= %.1f V)\n", i, extremaList[i].vmin, Vminlimit);
-                    }
-            
-                    // 5. Overcurrent (bit 6)
-                    if (extremaList[i].current >= current_max) {
-                        newStatusFault |= 0x40;
-                        anyFault = true;
-                        Serial.printf(" Stack %d: Overcurrent (%.1f A >= %.1f A)\n", i, extremaList[i].current, current_max);
-                    } 
-            
-                    // 6. Temperature checks (all sensors)
-                    for (size_t t = 0; t <  bms->NumThermistors ; ++t) {
-                        float temp = bms->batteryData_pack[i].gpioTemps[t];
-                
-                        // Overtemperature (bit 2)
-                        if (temp >= tempMAX) {
-                            newStatusFault |= 0x04;
-                            anyFault = true;
-                            Serial.printf(" Stack %d, Sensor %d: Over temp (%.1f°C >= %.1f°C)\n", i, t, temp, tempMAX);
-                        }
-                
-                        // Undertemperature (bit 3)
-                        if (temp <= tempMIN) {
-                            newStatusFault |= 0x08;
-                            anyFault = true;
-                            Serial.printf(" Stack %d, Sensor %d: Under temp (%.1f°C <= %.1f°C)\n", i, t, temp, tempMIN);
-                        }
-                    }
-                }
-                /* bms->get_data();
-                extremaList = AnalyzePerStackStats(bms->batteryData_pack); */
-            
-                // อัปเดต statusFault
-                statusFault = newStatusFault;
-        
-                // แสดง statusFault
-                if (anyFault) {
-                    Serial.printf(" statusFault: 0x%02X (", statusFault);
-                    if (statusFault & 0x01) Serial.print("CellOV ");
-                    if (statusFault & 0x02) Serial.print("CellUV ");
-                    if (statusFault & 0x04) Serial.print("OverTemp ");
-                    if (statusFault & 0x08) Serial.print("UnderTemp ");
-                    if (statusFault & 0x10) Serial.print("PackOV ");
-                    if (statusFault & 0x20) Serial.print("PackUV ");
-                    if (statusFault & 0x40) Serial.print("OverCurrent ");
-                    Serial.println(")");
-                }
-        
-                // ส่งข้อมูลผ่าน CAN (รวม statusFault)
-                //sendCAN();
-        
-                // === ตรวจสอบว่า Fault หายหรือยัง === //
-                if (!anyFault) {
-                    // ถ้าเพิ่งหาย → บันทึกเวลา
-                    if (!faultCleared) {
-                        faultClearTime = currentMillis;
-                        faultCleared = true;
-                        Serial.println(" All faults cleared! Waiting for stability...");
-                    }
-            
-                    // ตรวจสอบว่าปกติต่อเนื่องนานพอหรือยัง
-                    if (currentMillis - faultClearTime >= FAULT_CLEAR_DURATION) {
-                        Serial.println("\n===  Fault Recovery Successful ===");
-                        Serial.println("All conditions normal for 5 seconds");
-                        Serial.println("Returning to Active state");
-                        Serial.println(" Relay: ON");
-                
-                        currentState = Active;
-                        statusFault = 0x00;
-                        digitalWrite(Fault_led, LOW);
-                        digitalWrite(Relay, HIGH);  // เปิด Relay เมื่อปลอดภัยแล้ว
-                        break;  // ออกจาก Fault state
-                    }
-            
-                    // แสดงเวลาที่เหลือ
-                    unsigned long elapsed = currentMillis - faultClearTime;
-                    Serial.printf("  Stable: %.1f s / 5.0 s\n", elapsed / 1000.0f);
-            
-                } else {
-                    // ยังมี Fault → รีเซ็ตตัวนับ
-                    if (faultCleared) {
-                        Serial.println("Fault reappeared! Resetting stability timer");
-                        faultCleared = false;
-                    }
-                }
-                
-                digitalWrite(Fault_led, HIGH);
-                delay(FAULT_CHECK_INTERVAL);
-            }
-    
-            break;
-        }
-        
-    }
+    // Arduino loop() is no longer used!
+    // FreeRTOS scheduler handles all tasks
+    // Delete loop task to free resources
+    vTaskDelete(NULL);
 }
 
-void AnalyzePerStackStats(Stack_data result[], uint8_t numStacks) {
+// ========================================================================
+// ======================== HELPER FUNCTIONS ==============================
+// ========================================================================
+
+void initializeBMS() {
+    Serial.println("[BMS] Creating BMS object...");
     
-    for (uint8_t stackIndex = 0; stackIndex < numStacks; stackIndex++) {
-        const StackData& stack = bms->batteryData_pack[stackIndex];
-
-        Stack_data& extrema = result[stackIndex];
-        
-        // Reset values
-        extrema.vmin = 999.0f;
-        extrema.vmax = 0.0f;
-        extrema.vminCellsCount = 0;
-        extrema.vmaxCellsCount = 0;
-        
-        float totalVoltage = 0.0f;
-
-        // หา vmin, vmax
-        for (uint8_t i = 0; i < stack.numCells; i++) {
-            float v = stack.cells[i].voltage;
-            totalVoltage += v;
-
-            // Check vmin
-            if (v < extrema.vmin) {
-                extrema.vmin = v;
-                extrema.vminCellsCount = 0;
-                extrema.vminCells[extrema.vminCellsCount++] = i;
-            } else if (v == extrema.vmin && extrema.vminCellsCount < MAX_CELLS) {
-                extrema.vminCells[extrema.vminCellsCount++] = i;
-            }
-
-            // Check vmax
-            if (v > extrema.vmax) {
-                extrema.vmax = v;
-                extrema.vmaxCellsCount = 0;
-                extrema.vmaxCells[extrema.vmaxCellsCount++] = i;
-            } else if (v == extrema.vmax && extrema.vmaxCellsCount < MAX_CELLS) {
-                extrema.vmaxCells[extrema.vmaxCellsCount++] = i;
-            }
-        }
-        
-        // คำนวณค่าพื้นฐาน
-        extrema.total_voltage = totalVoltage;
-        extrema.averageVcell = totalVoltage / stack.numCells;
-        extrema.Vdiff = extrema.vmax - extrema.vmin;
-        extrema.current = 0.0f;  // ตั้งค่าเริ่มต้น
-        
-        // แสดงผล vmin, vmax
-        Serial.printf("Stack %d - Vmin: %.3f V [cells:", stackIndex, extrema.vmin);
-        for (uint8_t idx = 0; idx < extrema.vminCellsCount; idx++) {
-            Serial.printf(" %d", (int)extrema.vminCells[idx]);
-        }
-        Serial.printf(" ] | Vmax: %.3f V [cells:", extrema.vmax);
-        for (uint8_t idx = 0; idx < extrema.vmaxCellsCount; idx++) {
-            Serial.printf(" %d", (int)extrema.vmaxCells[idx]);
-        }
-        Serial.println(" ]");
+    // Delete old BMS object if exists
+    if (bms != nullptr) {
+        delete bms;
+        bms = nullptr;
     }
-
-    // คำนวณ current จาก stack สุดท้าย แล้วคัดลอกไปทุก stack
-    if (numStacks > 0) {
-        uint8_t lastStackIndex = numStacks - 1;
+    
+    // Create new BMS object with current config
+    bms = new BQ79600(mySerial, 1000000, 17, config);
+    
+    bool start = false;
+    
+    // Retry initialization until success
+    while (!start) {
+        delay(1000); 
+        digitalWrite(Fault_led, HIGH);   // Blink LEDs during init
+        digitalWrite(Active_led, HIGH);
         
-        // อ่าน busbar voltage จาก stack สุดท้าย
-        float busbarVolt = bms->batteryData_pack[lastStackIndex].busbarVolt;
+        bool init = bms->initialize();
         
-        // คำนวณ current (busbarVolt เป็น mV, shunt_resistance เป็น mΩ)
-        float current = busbarVolt / config.shunt_resistance;
-        
-        Serial.println("\n=== Current Calculation ===");
-        Serial.printf("r_shunt: %.6f mΩ\n", config.shunt_resistance);
-        Serial.printf("busbarVolt (Stack %d): %.3f mV\n", lastStackIndex, busbarVolt);
-        Serial.printf("Calculated Current: %.3f A\n", current);
-        Serial.println("===========================\n");
-        
-        // คัดลอก current ไปทุก stack
-        for (uint8_t i = 0; i < numStacks; i++) {
-            result[i].current = current;
+        if (init) {
+            Serial.println("[BMS] BQ79600 initialized successfully");
+            start = true;
         }
+        
+        digitalWrite(Fault_led, LOW);
+        digitalWrite(Active_led, LOW);
+        
     }
+    
+    delay(50);
+    bms->clearFault();  // Clear any lingering faults
+    Serial.println("[BMS] BMS ready\n");
 }
 
-bool status_balancing(){
-    int result[bms->NumSegments] ;
-    bool allCompleted = true;
-    uint8_t addressBQ = 0 ;
-    for(uint8_t stackIndex = 0; stackIndex < bms->NumSegments; ++stackIndex) {
-        addressBQ = stackIndex + 1;
-        result[stackIndex] = bms->checkBalance(addressBQ);
-        //----------------------------------------------------------------//
-        if (result[stackIndex] == 0x80){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("Invalid CB setting");
-            allCompleted = false;
-        }else if (result[stackIndex] == 0x40){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("NTC thermistor measurement is greater than OTCB_THR OR CBFET temp  is greater than CB TWARN"); 
-            allCompleted = false;  
-        }else if (result[stackIndex] == 0x20){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("cell balancing pause status");
-            allCompleted = false;
-        }else if (result[stackIndex] == 0x10){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("Module balancing");
-            allCompleted = false;
-        }else if (result[stackIndex] == 0x08){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("At least 1 cell is in active cell balancing");
-            allCompleted = false;
-        }else if (result[stackIndex] == 0x04){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println(" fault detect");
-            allCompleted = false;
-            currentState = Fault;
-        }else if (result[stackIndex] == 0x02){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("Module balancing completed");   
-            allCompleted = false;
-        }else if (result[stackIndex] == 0x01 ){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println(" All cell balancing is completed");   
-        }else if (result[stackIndex] == 0x00){
-            Serial.printf("=== Stack %d Balance Status (0x%02X) ===\n", stackIndex, result[stackIndex]);
-            Serial.println("✅ No balancing (idle/ready)");
-        //----------------------------------------------------------------//
-        }
-    }
-    if (allCompleted) {
-        Serial.println("=== All stacks balancing completed (all 0x00 or 0x01) ===");
-    } else {
-        Serial.println("=== ⏳ Balancing still in progress or other status detected ===");
-    }
-    
-    return allCompleted;
-}
-
-uint8_t voltageToHex(float Vmin) {
-
-    if (Vmin < 2.45f) Vmin = 2.45f;
-    if (Vmin > 4.00f) Vmin = 4.00f;
-
-    int step = round((Vmin - 2.45f) / 0.025f) + 1;
-    if (step < 1)  step = 1;
-    if (step > 63) step = 63;
-
-    float voltage_out = 2.45f + (step - 1) * 0.025f;
-    return voltage_out;
-}
-
-void sendFrameWithRetry(struct can_frame& frame) {
-    int result = mcp2515.sendMessage(&frame);
-    int retries = 0;
-    while (result != 0 && retries < MAX_RETRIES) {
-        delay(RETRY_DELAY_MS);
-        result = mcp2515.sendMessage(&frame);
-        retries++;
-    }
-    if (result != 0) {
-        Serial.printf("Frame 0x%03X failed after %d retries\n", frame.can_id, retries);
-    }
-}
-
-// ----- Send Summary (high priority) -----
-void sendSummaryCAN(int stackIndex, const Stack_data& ext, const StackData& stack) {
-    // Frame 1: totalV, current, vmin/vmax
-    struct can_frame frame1;
-    frame1.can_id  = CAN_ID_SUMMARY_BASE + (stackIndex << 4);
-    frame1.can_dlc = 8;
-
-    uint16_t totalV = (uint16_t)(ext.total_voltage * 10.0f);  // 0.1V per LSB
-    int16_t curr    = (int16_t)(ext.current * 10.0f);          // 0.1A per LSB
-    uint16_t vmin   = (uint16_t)(ext.vmin * 1000.0f);          // mV
-    uint16_t vmax   = (uint16_t)(ext.vmax * 1000.0f);
-
-    frame1.data[0] = (totalV >> 8) & 0xFF;
-    frame1.data[1] = totalV & 0xFF;
-    frame1.data[2] = (curr >> 8) & 0xFF;
-    frame1.data[3] = curr & 0xFF;
-    frame1.data[4] = (vmin >> 8) & 0xFF;
-    frame1.data[5] = vmin & 0xFF;
-    frame1.data[6] = (vmax >> 8) & 0xFF;
-    frame1.data[7] = vmax & 0xFF;
-
-    sendFrameWithRetry(frame1);
-
-    // Frame 2: Temps, averageVcell
-    struct can_frame frame2;
-    frame2.can_id  = CAN_ID_SUMMARY_BASE + (stackIndex << 4) + 1;
-    frame2.can_dlc = 8;
-
-    uint16_t avgV = (uint16_t)(ext.averageVcell * 1000.0f); // mV
-
-    frame2.data[0] = (int8_t)stack.dieTemp;
-    frame2.data[1] = (int8_t)stack.gpioTemps[0];
-    frame2.data[2] = (int8_t)stack.gpioTemps[1];
-    frame2.data[3] = 0; // reserved
-    frame2.data[4] = (avgV >> 8) & 0xFF;
-    frame2.data[5] = avgV & 0xFF;
-    frame2.data[6] = 0; // reserved
-    frame2.data[7] = 0;
-
-    sendFrameWithRetry(frame2);
-}
-
-// ----- Send Detail / Cell-level (low priority) -----
-void sendDetailCAN(int stackIndex, const StackData &stack) {
-    uint8_t raw[20];
-    int idx = 0;
-    
-    for (uint8_t i = 0; i < bms->NumCellsSeries; i++) {
-        uint16_t v = (uint16_t)(stack.cells[i].voltage * 1000.0f);
-        raw[idx++] = (v >> 8) & 0xFF;
-        raw[idx++] = v & 0xFF;
-    }
-
-    // สร้าง bitmask
-    uint16_t balanceMask = 0;
-    if (stackIndex < MAX_STACKS) {
-        for (uint8_t i = 0; i < currentlyBalancingCellsCount[stackIndex]; i++) {
-            size_t cellIndex = currentlyBalancingCells[stackIndex][i];
-            if (cellIndex < bms->NumCellsSeries) {
-                balanceMask |= (1 << cellIndex);
-            }
-        }
-    }
-
-    const uint8_t fragLens[3] = {8, 8, 7};
-    int offset = 0;
-    
-    for (int frag = 0; frag < 3; frag++) {
-        struct can_frame frame;
-        frame.can_id  = CAN_ID_DETAIL_BASE + (stackIndex << 4) + frag;
-        frame.can_dlc = fragLens[frag];
-        memcpy(frame.data, &raw[offset], fragLens[frag]);
-
-        if (frag == 2) {
-            frame.data[4] = (balanceMask >> 8) & 0xFF;
-            frame.data[5] = balanceMask & 0xFF;
-            frame.data[6] = statusFault;
-        }
-
-        sendFrameWithRetry(frame);
-        offset += fragLens[frag];
-    }
-}
-
-// ----- Main sendCAN function -----
-void sendCAN() {
-    unsigned long currentMillis = millis();
-
-    for (int i = 0; i < bms->NumSegments; i++) {
-        // Summary: high priority, send every loop
-        sendSummaryCAN(i, extremaList[i], bms->batteryData_pack[i]);
-
-        // Detail: low priority, send slower
-        if (loggingEnabled && (currentMillis - lastDetailTime >= detailInterval)) {
-            sendDetailCAN(i, bms->batteryData_pack[i]);
-        }
-    }
-
-    // Update lastDetailTime if we sent detail
-    if (loggingEnabled && (currentMillis - lastDetailTime >= detailInterval)) {
-        lastDetailTime = currentMillis;
-    }
-}
-void bms_balancing(){
-    for (uint8_t stackIndex = 0; stackIndex < bms->NumSegments; stackIndex++) {
-        
-        if (!balance_flag[stackIndex]) continue;
-        
-        const StackData& stack = bms->batteryData_pack[stackIndex];
-        
-        Serial.println("===============================");
-        Serial.printf("Stack %d (Address: %d): Cell Voltages:\n", 
-                      stackIndex, stackIndex + 1);
-        
-        for (uint8_t j = 0; j < stack.numCells; j++) {
-            Serial.printf("  Cell %2d (Index %2d) = %.3f V\n", 
-                          j + 1, j, stack.cells[j].voltage);
-        }
-        
-        Serial.println("===============================");
-        Serial.printf("Balancing Stack %d (Vmin=%.3f V | Vmax=%.3f V | Vdiff=%.3f V)\n",
-                      stackIndex, extremaList[stackIndex].vmin, 
-                      extremaList[stackIndex].vmax, extremaList[stackIndex].Vdiff);
-        
-        // === ค้นหา cells ที่ต้อง balance ===
-        size_t overVoltageCells[MAX_CELLS];
-        uint8_t overVoltageCellsCount = 0;
-        
-        for (uint8_t j = 0; j < stack.numCells; j++) {
-            if (stack.cells[j].voltage >= Vref[stackIndex]) {
-                overVoltageCells[overVoltageCellsCount++] = j;
-            }
-        }
-        
-        // === Bubble sort (จากสูงไปต่ำ) ===
-        for (uint8_t a = 0; a < overVoltageCellsCount - 1; a++) {
-            for (uint8_t b = 0; b < overVoltageCellsCount - a - 1; b++) {
-                if (stack.cells[overVoltageCells[b]].voltage < 
-                    stack.cells[overVoltageCells[b + 1]].voltage) {
-                    
-                    size_t temp = overVoltageCells[b];
-                    overVoltageCells[b] = overVoltageCells[b + 1];
-                    overVoltageCells[b + 1] = temp;
-                }
-            }
-        }
-        
-        // === กรอง cells ที่ติดกัน ===
-        size_t filteredCells[MAX_CELLS];
-        uint8_t filteredCount = 0;
-        
-        for (uint8_t j = 0; j < overVoltageCellsCount; j++) {
-            size_t current_cell = overVoltageCells[j];
-            bool isAdjacent = false;
-            
-            for (uint8_t k = 0; k < filteredCount; k++) {
-                int diff = (int)current_cell - (int)filteredCells[k];
-                if (diff >= -1 && diff <= 1) {
-                    isAdjacent = true;
-                    break;
-                }
-            }
-            
-            if (!isAdjacent && filteredCount < MAX_CELLS) {
-                filteredCells[filteredCount++] = current_cell;
-            }
-        }
-        
-        // === แสดงผล ===
-        Serial.println("------------------------------------------------");
-        Serial.printf("Balancing Stack %d (Address: %d)\n", 
-                      stackIndex, stackIndex + 1);
-        Serial.print("Selected Cells for Balancing: ");
-        for (uint8_t idx = 0; idx < filteredCount; idx++) {
-            Serial.printf("%d (%.3fV), ", 
-                          filteredCells[idx], stack.cells[filteredCells[idx]].voltage);
-        }
-        Serial.println();
-        Serial.println("------------------------------------------------");
-        
-        // === เรียก BalanceCells ===
-        if (filteredCount > 0) {
-            //  แปลง Vref → hex threshold
-            uint8_t hexThreshold = voltageToHex(Vref[stackIndex]);
-            uint8_t addressBQ = stackIndex + 1;
-            
-            // เก็บ cells ที่ balance
-            for (uint8_t idx = 0; idx < filteredCount; idx++) {
-                currentlyBalancingCells[stackIndex][idx] = filteredCells[idx];
-            }
-            currentlyBalancingCellsCount[stackIndex] = filteredCount;
-            
-            Serial.printf("  → Sending to BQ79600 Address: %d\n", addressBQ);
-            Serial.printf("  → V_ref: %.3f V → Hex: 0x%02X\n", 
-                          Vref[stackIndex], hexThreshold);
-            
-            //  เรียก BalanceCells (5 parameters)
-            bms->BalanceCells(Auto, addressBQ, 
-                             currentlyBalancingCells[stackIndex],
-                             currentlyBalancingCellsCount[stackIndex],
-                             hexThreshold);
-        }
-    }
-}
-void print_data_balance(){
-    for (uint8_t stack = 0; stack < bms->NumSegments; stack++) {
-        const StackData& kts = bms->batteryData_pack[stack];
-        
-        Serial.println("===============================");
-        Serial.printf("Stack %d (Address: %d): Cell Voltages:\n", stack, stack + 1);
-        
-        for (uint8_t cell = 0; cell < kts.numCells; cell++) {
-            Serial.printf("  Cell %2d (Index %2d) = %.3f V\n", 
-                          cell + 1, cell, kts.cells[cell].voltage);
-        }
-        
-        Serial.println("===============================");
-        Serial.printf("volt stack: %.2f V\n", extremaList[stack].total_voltage);
-        Serial.printf("volt AVG: %.3f V\n", extremaList[stack].averageVcell);
-        Serial.printf("volt diff: %.3f V\n", extremaList[stack].Vdiff);
-        Serial.printf("V_ref: %.3f V\n", Vref[stack]);
-        Serial.printf("Temp1: %.1f °C\n", kts.gpioTemps[0]);
-        Serial.printf("Temp2: %.1f °C\n", kts.gpioTemps[1]);
-        Serial.printf("DieTemp: %.1f °C\n", kts.dieTemp);
-        Serial.println("===============================");
-        
-        Serial.print("Balancing Cells: ");
-        if (currentlyBalancingCellsCount[stack] > 0) {
-            for (uint8_t idx = 0; idx < currentlyBalancingCellsCount[stack]; idx++) {
-                size_t cellIdx = currentlyBalancingCells[stack][idx];
-                Serial.printf("%d (%.3fV), ", cellIdx, kts.cells[cellIdx].voltage);
-            }
-        } else {
-            Serial.print("None");
-        }
-        Serial.println();
-    }
-    Serial.println();
-}
-
-void print_data_active(){
-    for (uint8_t stack = 0; stack < bms->NumSegments; stack++) {
-        const StackData& kts = bms->batteryData_pack[stack];
-        
-        Serial.println("===============================");
-        Serial.printf("Stack %d (Address: %d): Cell Voltages:\n", stack, stack + 1);
-        
-        for (uint8_t cell = 0; cell < kts.numCells; cell++) {
-            Serial.printf("  Cell %2d (Index %2d) = %.3f V\n", 
-                          cell + 1, cell, kts.cells[cell].voltage);
-        }
-        
-        Serial.println("===============================");
-        Serial.printf("volt stack: %.2f V\n", extremaList[stack].total_voltage);
-        Serial.printf("volt AVG: %.3f V\n", extremaList[stack].averageVcell);
-        Serial.printf("V_ref: %.3f V\n", Vref[stack]);
-        Serial.printf("Temp1: %.1f °C\n", kts.gpioTemps[0]);
-        Serial.printf("Temp2: %.1f °C\n", kts.gpioTemps[1]);
-        Serial.printf("DieTemp: %.1f °C\n", kts.dieTemp);
-        Serial.println("===============================");
-    }
-    Serial.println();
-}
-
-bool checkFaults() {
-
-    if(interruptTriggered) {
-        Serial.println("⚠️ Interrupt triggered! Checking faults...");
-        interruptTriggered = false;  
-        return true; 
-    }
-    
-    for(uint8_t i = 0; i < bms->NumSegments; i++) {
-        
-        // Current check
-        if (extremaList[i].current >= current_max) {
-            Serial.printf("⚠️ Stack %d: Over current (%.1f A)\n", i, extremaList[i].current);
-            return true;
-        }
-        
-        // Cell voltage checks
-        if (extremaList[i].vmax > Vmaxlimit) {
-            Serial.printf("⚠️ Stack %d: Over voltage (%.3f V)\n", i, extremaList[i].vmax);
-            return true;
-        }
-        
-        if (extremaList[i].vmin < Vminlimit) {
-            Serial.printf("⚠️ Stack %d: Under voltage (%.3f V)\n", i, extremaList[i].vmin);
-            return true;
-        }
-        
-        // Pack voltage checks
-        if (extremaList[i].total_voltage > Vmaxlimit_pack) {
-            Serial.printf("⚠️ Stack %d: Pack over voltage (%.1f V)\n", i, extremaList[i].total_voltage);
-            return true;
-        }
-        
-        if (extremaList[i].total_voltage < Vminlimit_pack) {
-            Serial.printf("⚠️ Stack %d: Pack under voltage (%.1f V)\n", i, extremaList[i].total_voltage);
-            return true;
-        }
-        
-        // Temperature checks (all sensors)
-        for (uint8_t t = 0; t < bms->NumThermistors; t++) {
-            float temp = bms->batteryData_pack[i].gpioTemps[t];
-            if (temp >= tempMAX || temp <= tempMIN) {
-                Serial.printf("⚠️ Stack %d, Sensor %d: Temp fault (%.1f°C, Limit: %.1f-%.1f°C)\n",
-                              i, t, temp, tempMIN, tempMAX);
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
-bool checkHardwareFaults() {
-    Serial.println("\n=== Checking Hardware Faults from IC ===");
-    
-    uint8_t stackFaults[MAX_STACKS];
-    uint8_t otpFaults[MAX_STACKS];
-    
-    bool anyHardwareFault = false;
-    uint8_t hardwareStatusFault = 0x00;
-    
-    // เช็ค Base Device Faults
-    Serial.println("\n--- Checking Base Device Faults (BQ79612) ---");
-    bms->Fault_Summary(stackFaults);
-    
-    for (uint8_t physicalIdx = 0; physicalIdx < bms->NumSegments; physicalIdx++) {
-        uint8_t logicalIdx = (bms->NumSegments - 1) - physicalIdx;
-        
-        if (stackFaults[physicalIdx] != 0x00) {
-            anyHardwareFault = true;
-            
-            Serial.printf("⚠️ Stack %d (Address: %d) Base Fault: 0x%02X\n",
-                          logicalIdx, logicalIdx + 1, stackFaults[physicalIdx]);
-            
-            if (stackFaults[physicalIdx] & 0x80) {
-                Serial.printf("  → Stack %d: FAULT_PROT\n", logicalIdx);
-                hardwareStatusFault |= 0x80;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x40) {
-                Serial.printf("  → Stack %d: FAULT_COMP_ADC\n", logicalIdx);
-                hardwareStatusFault |= 0x80;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x20) {
-                Serial.printf("  → Stack %d: FAULT_OTP\n", logicalIdx);
-                
-                bms->FAULT_OTP(otpFaults);
-                
-                Serial.print("  Response: ");
-                for (uint8_t j = 0; j < bms->NumSegments; j++) {
-                    Serial.printf("0x%02X ", otpFaults[j]);
-                }
-                Serial.println();
-                
-                hardwareStatusFault |= 0x80;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x10) {
-                Serial.printf("  → Stack %d: FAULT_COMM\n", logicalIdx);
-                hardwareStatusFault |= 0x80;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x08) {
-                Serial.printf("  → Stack %d: FAULT_OTUT\n", logicalIdx);
-                hardwareStatusFault |= 0x0C;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x04) {
-                Serial.printf("  → Stack %d: FAULT_OVUV\n", logicalIdx);
-                hardwareStatusFault |= 0x03;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x02) {
-                Serial.printf("  → Stack %d: FAULT_SYS\n", logicalIdx);
-                hardwareStatusFault |= 0x80;
-            }
-            
-            if (stackFaults[physicalIdx] & 0x01) {
-                Serial.printf("  → Stack %d: FAULT_PWR\n", logicalIdx);
-                hardwareStatusFault |= 0x80;
-            }
-        } else {
-            Serial.printf(" Stack %d (Address: %d): No base faults\n", 
-                          logicalIdx, logicalIdx + 1);
-        }
-    }
-    
-    // Bridge Device Fault
-    Serial.println("\n--- Checking Bridge Device Faults (BQ79600) ---");
-    uint8_t bridgeFault = bms->FaultM_Summary();
-    
-    if (bridgeFault != 0x00) {
-        anyHardwareFault = true;
-        
-        Serial.printf(" Bridge Fault: 0x%02X\n", bridgeFault);
-        
-        if (bridgeFault & 0x08) {
-            Serial.println("  → Bridge: FAULT_COMM");
-            uint8_t comm1 = bms->FaultM_Comm1();
-            uint8_t comm2 = bms->FaultM_Comm2();
-            Serial.printf("  Response1: 0x%02X, Response2: 0x%02X\n", comm1, comm2);
-            hardwareStatusFault |= 0x80;
-        }
-        
-        if (bridgeFault & 0x04) {
-            Serial.println("  → Bridge: FAULT_REG");
-            uint8_t reg = bms->FaultM_REG();
-            Serial.printf("  Response: 0x%02X\n", reg);
-            bms->cheak();
-            hardwareStatusFault |= 0x80;
-        }
-        
-        if (bridgeFault & 0x02) {
-            Serial.println("  → Bridge: FAULT_SYS");
-            hardwareStatusFault |= 0x80;
-        }
-        
-        if (bridgeFault & 0x01) {
-            Serial.println("  → Bridge: FAULT_PWR");
-            uint8_t pwr = bms->FaultM_PWR();
-            Serial.printf("  Response: 0x%02X\n", pwr);
-            hardwareStatusFault |= 0x80;
-        }
-    } else if (bridgeFault == 0xFF) {
-        Serial.println(" Bridge: Failed to read fault status");
-        anyHardwareFault = true;
-        hardwareStatusFault |= 0x80;
-    } else {
-        Serial.println(" Bridge: No faults");
-    }
-    
-    if (anyHardwareFault) {
-        statusFault = hardwareStatusFault;
-        
-        Serial.printf("\n Hardware statusFault: 0x%02X (", statusFault);
-        if (statusFault & 0x80) Serial.print("HW_Fault ");
-        if (statusFault & 0x40) Serial.print("OverCurrent ");
-        if (statusFault & 0x20) Serial.print("PackUV ");
-        if (statusFault & 0x10) Serial.print("PackOV ");
-        if (statusFault & 0x08) Serial.print("UnderTemp ");
-        if (statusFault & 0x04) Serial.print("OverTemp ");
-        if (statusFault & 0x02) Serial.print("CellUV ");
-        if (statusFault & 0x01) Serial.print("CellOV ");
-        Serial.println(")");
-    }
-    
-    Serial.println("=========================================\n");
-    return anyHardwareFault;
-}
 void applyConfigToGlobals() {
-    Serial.println("\n--- Applying Configuration to Globals ---");
+    Serial.println("\n--- Applying Configuration ---");
     
+    // Get config from manager
     const HardwareConfig& hwConfig = configManager.getHardwareConfig();
     const ProtectionLimits& protLimits = configManager.getProtectionLimits();
     
-    // Hardware Config
+    // Apply hardware config
     config.num_segments = hwConfig.num_segments;
     config.num_cells_series = hwConfig.num_cells_series;
     config.num_thermistors = hwConfig.num_thermistors;
@@ -1084,9 +925,9 @@ void applyConfigToGlobals() {
     Serial.printf("  Segments      : %d\n", config.num_segments);
     Serial.printf("  Cells/Series  : %d\n", config.num_cells_series);
     Serial.printf("  Thermistors   : %d\n", config.num_thermistors);
-    Serial.printf("  Shunt R       : %.3f Ω\n", config.shunt_resistance);
+    Serial.printf("  Shunt R       : %.3f Ohm\n", config.shunt_resistance);
     
-    // Protection Limits
+    // Apply protection limits
     tempMAX = protLimits.temp_max;
     tempMIN = protLimits.temp_min;
     Vmaxlimit = protLimits.cell_v_max;
@@ -1095,79 +936,512 @@ void applyConfigToGlobals() {
     Vminlimit_pack = protLimits.pack_v_min;
     current_max = protLimits.current_max;
     VoltDiffBalance = protLimits.volt_diff_balance;
-
+    
     Serial.println("\nProtection Limits:");
-    Serial.printf("  Temp Max      : %.1f °C\n", tempMAX);
-    Serial.printf("  Temp Min      : %.1f °C\n", tempMIN);
+    Serial.printf("  Temp Max      : %.1f C\n", tempMAX);
+    Serial.printf("  Temp Min      : %.1f C\n", tempMIN);
     Serial.printf("  Cell V Max    : %.3f V\n", Vmaxlimit);
     Serial.printf("  Cell V Min    : %.3f V\n", Vminlimit);
     Serial.printf("  Pack V Max    : %.1f V\n", Vmaxlimit_pack);
     Serial.printf("  Pack V Min    : %.1f V\n", Vminlimit_pack);
     Serial.printf("  Current Max   : %.1f A\n", current_max);
     Serial.printf("  Balance Diff  : %.3f V\n", VoltDiffBalance);
+    Serial.println("------------------------------\n");
 }
-// ========== Initialize BMS ==========
-void initializeBMS() {
-    Serial.println("Creating BMS object with current config...");
-    
-    if (bms != nullptr) {
-        delete bms;
-        bms = nullptr;
+
+void AnalyzePerStackStats(Stack_data result[], uint8_t numStacks) {
+    // Loop through all stacks
+    for (uint8_t stackIndex = 0; stackIndex < numStacks; stackIndex++) {
+        const StackData& stack = bms->batteryData_pack[stackIndex];
+        Stack_data& extrema = result[stackIndex];
+        
+        // Reset values for this stack
+        extrema.vmin = 999.0f;
+        extrema.vmax = 0.0f;
+        extrema.vminCellsCount = 0;
+        extrema.vmaxCellsCount = 0;
+        
+        float totalVoltage = 0.0f;
+        
+        // Find vmin, vmax for all cells in this stack
+        for (uint8_t i = 0; i < stack.numCells; i++) {
+            float v = stack.cells[i].voltage;
+            totalVoltage += v;
+            
+            // Check for new minimum voltage
+            if (v < extrema.vmin) {
+                extrema.vmin = v;                           // Update vmin
+                extrema.vminCellsCount = 0;                 // Reset count
+                extrema.vminCells[extrema.vminCellsCount++] = i;  // Store cell index
+            } 
+            // Check if equal to current vmin (multiple cells)
+            else if (v == extrema.vmin && extrema.vminCellsCount < MAX_CELLS) {
+                extrema.vminCells[extrema.vminCellsCount++] = i;
+            }
+            
+            // Check for new maximum voltage
+            if (v > extrema.vmax) {
+                extrema.vmax = v;
+                extrema.vmaxCellsCount = 0;
+                extrema.vmaxCells[extrema.vmaxCellsCount++] = i;
+            }
+            // Check if equal to current vmax
+            else if (v == extrema.vmax && extrema.vmaxCellsCount < MAX_CELLS) {
+                extrema.vmaxCells[extrema.vmaxCellsCount++] = i;
+            }
+        }
+        
+        // Calculate stack statistics
+        extrema.total_voltage = totalVoltage;
+        extrema.averageVcell = totalVoltage / stack.numCells;
+        extrema.Vdiff = extrema.vmax - extrema.vmin;
+        extrema.current = 0.0f;  // Will be calculated below
+        
+        // Debug print (with mutex protection)
+                
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            
+            // ✅ หัวข้อ Stack
+            Serial.printf("\n=== Stack %d ===\n", stackIndex);
+            Serial.printf("Vmin: %.3f V [cells:", extrema.vmin);
+            for (uint8_t idx = 0; idx < extrema.vminCellsCount; idx++) {
+                Serial.printf(" %d", (int)extrema.vminCells[idx]);
+            }
+            Serial.printf("] | Vmax: %.3f V [cells:", extrema.vmax);
+            for (uint8_t idx = 0; idx < extrema.vmaxCellsCount; idx++) {
+                Serial.printf(" %d", (int)extrema.vmaxCells[idx]);
+            }
+            Serial.printf("]\n");
+            
+            // ✅ เพิ่มใหม่: ปริ้น Cell Voltage ทั้งหมด
+            Serial.println("--- Cell Voltages ---");
+            for (uint8_t cellIdx = 0; cellIdx < stack.numCells; cellIdx++) {
+                Serial.printf("  Cell %2d: %.3f V", cellIdx, stack.cells[cellIdx].voltage);
+                
+                // ✅ ทำเครื่องหมาย Min/Max
+                if (cellIdx == extrema.vminCells[0]) {
+                    Serial.print(" ← MIN");
+                }
+                if (cellIdx == extrema.vmaxCells[0]) {
+                    Serial.print(" ← MAX");
+                }
+                
+                Serial.println();
+            }
+            Serial.println("--- temperatures ---");
+            for (uint8_t ntc = 0; ntc < stack.numTemps; ntc++) {
+                Serial.printf("  NTC %2d: %.3f °C", ntc, stack.gpioTemps[ntc]);
+                Serial.println();
+            }
+            
+            // ✅ สรุป Stack Statistics
+            Serial.printf("Total Voltage: %.3f V\n", extrema.total_voltage);
+            Serial.printf("Avg Cell: %.3f V\n", extrema.averageVcell);
+            Serial.printf("Vdiff: %.3f V\n", extrema.Vdiff);
+            Serial.println("====================\n");
+            
+            xSemaphoreGive(xMutex_Serial);
+        }
     }
     
-    bms = new BQ79600(mySerial, 1000000, 17, config);
-    
-    bool start = false;
-    
-    while (!start) {
-        digitalWrite(Fault_led, HIGH);
-        digitalWrite(Active_led, HIGH);
+    // Calculate current from last stack's busbar voltage
+    if (numStacks > 0) {
+        uint8_t lastStackIndex = 0;
+        float busbarVolt = bms->batteryData_pack[lastStackIndex].busbarVolt;  // mV
         
-        bool init = bms->initialize();
+        // Current = Voltage / Resistance (I = V / R)
+        // busbarVolt: mV, shunt_resistance: mOhm -> Current: A
+        float current = busbarVolt / config.shunt_resistance;
         
-        if (init) {
-            Serial.println(" BQ79600 initialized successfully");
-            start = true;
-        } 
-        digitalWrite(Fault_led, LOW);
-        digitalWrite(Active_led, LOW);
-        delay(50);
+        // Copy current to all stacks
+        for (uint8_t i = 0; i < numStacks; i++) {
+            result[i].current = current;
+        }
+        
+        // Debug print current calculation
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("\n=== Current Calculation ===");
+            Serial.printf("Shunt R: %.6f mOhm\n", config.shunt_resistance);
+            Serial.printf("Busbar Voltage (Stack %d): %.3f mV\n", lastStackIndex, busbarVolt);
+            Serial.printf("Current: %.3f A\n", current);
+            Serial.println("===========================\n");
+            xSemaphoreGive(xMutex_Serial);
+        }
+    }
+}
+
+bool checkFaults() {
+    // Check interrupt flag first
+    /* if (interruptTriggered) {
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Fault] Interrupt triggered!");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        interruptTriggered = false;
+        return true;
+    } */
+    
+    // Check all stacks for faults
+    for (uint8_t i = 0; i < bms->NumSegments; i++) {
+        // Overcurrent check
+        if (extremaList[i].current >= current_max) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[Fault] Stack %d: Overcurrent (%.1f A >= %.1f A)\n",
+                              i, extremaList[i].current, current_max);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            return true;
+        }
+        
+        // Cell overvoltage check
+        if (extremaList[i].vmax > Vmaxlimit) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[Fault] Stack %d: Cell OV (%.3f V > %.3f V)\n",
+                              i, extremaList[i].vmax, Vmaxlimit);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            return true;
+        }
+        
+        // Cell undervoltage check
+        if (extremaList[i].vmin < Vminlimit) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[Fault] Stack %d: Cell UV (%.3f V < %.3f V)\n",
+                              i, extremaList[i].vmin, Vminlimit);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            return true;
+        }
+        
+        // Pack overvoltage check
+        if (extremaList[i].total_voltage > Vmaxlimit_pack) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[Fault] Stack %d: Pack OV (%.1f V > %.1f V)\n",
+                              i, extremaList[i].total_voltage, Vmaxlimit_pack);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            return true;
+        }
+        
+        // Pack undervoltage check
+        if (extremaList[i].total_voltage < Vminlimit_pack) {
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[Fault] Stack %d: Pack UV (%.1f V < %.1f V)\n",
+                              i, extremaList[i].total_voltage, Vminlimit_pack);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            return true;
+        }
+        
+        // Temperature checks (all thermistors)
+        for (uint8_t t = 0; t < bms->NumThermistors; t++) {
+            float temp = bms->batteryData_pack[i].gpioTemps[t];
+            
+            // Overtemperature check
+            if (temp >= tempMAX) {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.printf("[Fault] Stack %d, Sensor %d: Over temp (%.1f C >= %.1f C)\n",
+                                  i, t, temp, tempMAX);
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                return true;
+            }
+            
+            // Undertemperature check
+            if (temp <= tempMIN) {
+                if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    Serial.printf("[Fault] Stack %d, Sensor %d: Under temp (%.1f C <= %.1f C)\n",
+                                  i, t, temp, tempMIN);
+                    xSemaphoreGive(xMutex_Serial);
+                }
+                return true;
+            }
+        }
     }
     
-    delay(50);
-    bms->clearFault();
-    Serial.println(" BMS ready\n");
+    return false;  // No faults detected
 }
-void handleCANMessages() {
-    struct can_frame frame;
+
+bool checkHardwareFaults() {
+    if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+        Serial.println("\n=== Checking Hardware Faults ===");
+        xSemaphoreGive(xMutex_Serial);
+    }
     
-    while (mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
+    uint8_t stackFaults[MAX_STACKS];
+    bool anyHardwareFault = false;
+    uint8_t hardwareStatusFault = 0x00;
+    uint8_t bridgeFault = 0x00;
+    
+    // ===== ✅ ล็อก UART สั้นๆ (เฉพาะการอ่าน) =====
+    if (xSemaphoreTake(xMutex_BMS_UART, pdMS_TO_TICKS(300)) == pdTRUE) {
         
-        if (frame.can_id == CAN_ID_CONFIG) {
+        // ✅ Debug: เข้า UART Mutex สำเร็จ
+        /* if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Safety] ✅ UART Mutex acquired successfully");
+            xSemaphoreGive(xMutex_Serial);
+        } */
+        
+        // อ่าน Fault จาก Base Devices (BQ79612) - ~6ms
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Safety] Calling bms->Fault_Summary()...");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        bms->Fault_Summary(stackFaults);
+        
+        /* if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Safety] ✅ bms->Fault_Summary() completed");
+            xSemaphoreGive(xMutex_Serial);
+        } */
+        
+        // อ่าน Fault จาก Bridge Device (BQ79600) - ~2ms
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Safety] Calling bms->FaultM_Summary()...");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        bridgeFault = bms->FaultM_Summary();
+        
+        // ✅ Debug: แสดง bridgeFault value
+        /* if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.printf("[Safety] ✅ bms->FaultM_Summary() returned: 0x%02X\n", bridgeFault);
+            Serial.println("[Safety] checkHardwareFaults completed");
+            xSemaphoreGive(xMutex_Serial);
+        } */
+        
+        // ← ปลดล็อก UART (รวม ~8ms)
+        xSemaphoreGive(xMutex_BMS_UART);
+        
+    } else {
+        // ✅ Timeout handling: อย่าให้ System crash
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("[Safety] ⚠️ WARNING: UART mutex timeout (checkHardwareFaults)");
+            Serial.println("[Safety]   → Task_BMS is holding UART mutex");
+            Serial.println("[Safety]   ⏭️ Skipping hardware fault check this cycle");
+            Serial.printf("[Safety]   → Timeout was waiting for: 300 ms\n");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        // ✅ Return false (ถือว่าไม่มี fault - ปลอดภัย)
+        return false;
+    }
+    
+    // ===== ✅ วิเคราะห์ผลลัพธ์ (นอก UART Mutex) =====
+    for (uint8_t physicalIdx = 0; physicalIdx < bms->NumSegments; physicalIdx++) {
+        uint8_t logicalIdx = (bms->NumSegments - 1) - physicalIdx;
+        
+        if (stackFaults[physicalIdx] != 0x00) {
+            anyHardwareFault = true;
             
-            Serial.printf("\n Received CAN Config (ID: 0x%03X, Len: %d)\n", frame.can_id, frame.can_dlc);
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("[HW Fault] Stack %d: 0x%02X\n", logicalIdx, stackFaults[physicalIdx]);
+                
+                if (stackFaults[physicalIdx] & 0x80) Serial.println("  - FAULT_PROT");
+                if (stackFaults[physicalIdx] & 0x40) Serial.println("  - FAULT_COMP_ADC");
+                if (stackFaults[physicalIdx] & 0x20) Serial.println("  - FAULT_OTP");
+                if (stackFaults[physicalIdx] & 0x10) Serial.println("  - FAULT_COMM");
+                if (stackFaults[physicalIdx] & 0x08) Serial.println("  - FAULT_OTUT");
+                if (stackFaults[physicalIdx] & 0x04) Serial.println("  - FAULT_OVUV");
+                if (stackFaults[physicalIdx] & 0x02) Serial.println("  - FAULT_SYS");
+                if (stackFaults[physicalIdx] & 0x01) Serial.println("  - FAULT_PWR");
+                
+                xSemaphoreGive(xMutex_Serial);
+            }
             
-            Serial.print("Data: ");
-            for (uint8_t i = 0; i < frame.can_dlc; i++) {
-                Serial.printf("%02X ", frame.data[i]);
+            hardwareStatusFault |= 0x80;
+        }
+    }
+    
+    // Check Bridge Device Fault
+    if (bridgeFault != 0x00 && bridgeFault != 0xFF) {
+        anyHardwareFault = true;
+        
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.printf("[HW Fault] Bridge: 0x%02X\n", bridgeFault);
+            
+            if (bridgeFault & 0x08) Serial.println("  - FAULT_COMM");
+            if (bridgeFault & 0x04) Serial.println("  - FAULT_REG");
+            if (bridgeFault & 0x02) Serial.println("  - FAULT_SYS");
+            if (bridgeFault & 0x01) Serial.println("  - FAULT_PWR");
+            
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        hardwareStatusFault |= 0x80;
+    }
+    
+    if (anyHardwareFault) {
+        statusFault = hardwareStatusFault;
+        
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.printf("Hardware statusFault: 0x%02X\n", statusFault);
+            Serial.println("===================================\n");
+            xSemaphoreGive(xMutex_Serial);
+        }
+    }
+    
+    return anyHardwareFault;
+}
+
+bool status_balancing(uint8_t numStacks) {
+    int result[MAX_STACKS];
+    bool allCompleted = true;
+    
+    // Check balancing status for all stacks
+    for (uint8_t stackIndex = 0; stackIndex < numStacks; ++stackIndex) {
+        uint8_t addressBQ = stackIndex + 1;
+        result[stackIndex] = bms->checkBalance(addressBQ);
+        
+        // Decode status
+        if (result[stackIndex] == 0x01 || result[stackIndex] == 0x00) {
+            // Completed or idle
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("Stack %d: Balancing completed (0x%02X)\n", 
+                              stackIndex, result[stackIndex]);
+                xSemaphoreGive(xMutex_Serial);
+            }
+        } else {
+            // Still in progress or error
+            allCompleted = false;
+            
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("Stack %d: Status 0x%02X - ", stackIndex, result[stackIndex]);
+                
+                // Decode status bits
+                if (result[stackIndex] & 0x80) Serial.print("Invalid CB setting ");
+                if (result[stackIndex] & 0x40) Serial.print("Temp warning ");
+                if (result[stackIndex] & 0x20) Serial.print("Paused ");
+                if (result[stackIndex] & 0x10) Serial.print("Module balancing ");
+                if (result[stackIndex] & 0x08) Serial.print("Active balancing ");
+                if (result[stackIndex] & 0x04) Serial.print("Fault ");
+                if (result[stackIndex] & 0x02) Serial.print("Module complete ");
+                
+                Serial.println();
+                xSemaphoreGive(xMutex_Serial);
+            }
+        }
+    }
+    
+    return allCompleted;
+}
+
+uint8_t voltageToHex(float Vmin) {
+    // Clamp to valid range [2.45V - 4.00V]
+    if (Vmin < 2.45f) Vmin = 2.45f;
+    if (Vmin > 4.00f) Vmin = 4.00f;
+    
+    // Calculate step (0.025V per step, starting from 2.45V)
+    int step = round((Vmin - 2.45f) / 0.025f) + 1;
+    
+    // Clamp step [1-63]
+    if (step < 1) step = 1;
+    if (step > 63) step = 63;
+    
+    // Convert back to voltage
+    float voltage_out = 2.45f + (step - 1) * 0.025f;
+    
+    return (uint8_t)step;
+}
+void bms_balancing(uint8_t numStacks) {
+    // Loop through all stacks
+    for (uint8_t stackIndex = 0; stackIndex < numStacks; stackIndex++) {
+        // Skip if this stack doesn't need balancing
+        if (!balance_flag[stackIndex]) continue;
+        
+        const StackData& stack = bms->batteryData_pack[stackIndex];
+        
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.println("===============================");
+            Serial.printf("Balancing Stack %d (Address: %d)\n", stackIndex, stackIndex + 1);
+            Serial.printf("Vmin: %.3f V | Vmax: %.3f V | Vdiff: %.3f V\n",
+                          extremaList[stackIndex].vmin, extremaList[stackIndex].vmax, 
+                          extremaList[stackIndex].Vdiff);
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        // Find cells that need balancing (voltage >= Vref)
+        size_t overVoltageCells[MAX_CELLS];
+        uint8_t overVoltageCellsCount = 0;
+        
+        for (uint8_t j = 0; j < stack.numCells; j++) {
+            if (stack.cells[j].voltage >= Vref[stackIndex]) {
+                overVoltageCells[overVoltageCellsCount++] = j;
+            }
+        }
+        
+        // Bubble sort (descending order: highest voltage first)
+        for (uint8_t a = 0; a < overVoltageCellsCount - 1; a++) {
+            for (uint8_t b = 0; b < overVoltageCellsCount - a - 1; b++) {
+                if (stack.cells[overVoltageCells[b]].voltage < 
+                    stack.cells[overVoltageCells[b + 1]].voltage) {
+                    // Swap
+                    size_t temp = overVoltageCells[b];
+                    overVoltageCells[b] = overVoltageCells[b + 1];
+                    overVoltageCells[b + 1] = temp;
+                }
+            }
+        }
+        
+        // Filter out adjacent cells (can't balance adjacent cells simultaneously)
+        size_t filteredCells[MAX_CELLS];
+        uint8_t filteredCount = 0;
+        
+        for (uint8_t j = 0; j < overVoltageCellsCount; j++) {
+            size_t current_cell = overVoltageCells[j];
+            bool isAdjacent = false;
+            
+            // Check if adjacent to already selected cell
+            for (uint8_t k = 0; k < filteredCount; k++) {
+                int diff = (int)current_cell - (int)filteredCells[k];
+                if (diff >= -1 && diff <= 1) {  // Adjacent (±1)
+                    isAdjacent = true;
+                    break;
+                }
+            }
+            
+            // Add if not adjacent
+            if (!isAdjacent && filteredCount < MAX_CELLS) {
+                filteredCells[filteredCount++] = current_cell;
+            }
+        }
+        
+        // Debug print selected cells
+        if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+            Serial.print("Selected Cells: ");
+            for (uint8_t idx = 0; idx < filteredCount; idx++) {
+                Serial.printf("%d (%.3fV), ", filteredCells[idx], 
+                              stack.cells[filteredCells[idx]].voltage);
             }
             Serial.println();
+            Serial.println("------------------------------------------------");
+            xSemaphoreGive(xMutex_Serial);
+        }
+        
+        // Execute balancing if cells selected
+        if (filteredCount > 0) {
+            // Convert Vref to hex threshold
+            uint8_t hexThreshold = voltageToHex(Vref[stackIndex]);
+            uint8_t addressBQ = stackIndex + 1;
             
-            bool ok = configManager.processCANCommand(
-                frame.can_id,
-                frame.data,
-                frame.can_dlc
-            );
-            
-            if (ok) {
-                Serial.println(" Config command processed\n");
-                
-                //  Hot Reload Protection Limits
-                applyConfigToGlobals();
-                
-            } else {
-                Serial.println(" Config command failed!\n");
+            // Store balancing cells
+            for (uint8_t idx = 0; idx < filteredCount; idx++) {
+                currentlyBalancingCells[stackIndex][idx] = filteredCells[idx];
             }
+            currentlyBalancingCellsCount[stackIndex] = filteredCount;
+            
+            if (xSemaphoreTake(xMutex_Serial, pdMS_TO_TICKS(50)) == pdTRUE) {
+                Serial.printf("Sending to BQ79600 Address: %d\n", addressBQ);
+                Serial.printf("Vref: %.3f V -> Hex: 0x%02X\n", Vref[stackIndex], hexThreshold);
+                xSemaphoreGive(xMutex_Serial);
+            }
+            
+            // Call BMS balancing function
+            bms->BalanceCells(1,  // Auto mode
+                             addressBQ, 
+                             currentlyBalancingCells[stackIndex],
+                             currentlyBalancingCellsCount[stackIndex],
+                             hexThreshold);
         }
     }
 }

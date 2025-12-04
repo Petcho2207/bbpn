@@ -10,10 +10,10 @@ BMSConfigManager::BMSConfigManager() {
 
 void BMSConfigManager::setDefaults() {
     // Hardware Config (float values)
-    hw_config.num_segments = 3;
-    hw_config.num_cells_series = 9;
+    hw_config.num_segments = 1;
+    hw_config.num_cells_series = 10;
     hw_config.num_thermistors = 2;
-    hw_config.shunt_resistance = 1.5f;  // 1.5 Ω
+    hw_config.shunt_resistance = 1.5f;  // 1.5 mΩ
     hw_config.crc = 0;
     
     // Protection Limits (float values)
